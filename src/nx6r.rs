@@ -358,7 +358,7 @@ fn compress_xz_stream(cat: UnitCategory, preset: u32, bucket: &[PackUnit]) -> io
 }
 
 pub fn pack_nx6r(
-    source_path: Path,
+    source_path: &Path,
     output_path: &Path,
     preset: u32,
     unpack_apks: bool,
