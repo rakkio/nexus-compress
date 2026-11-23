@@ -723,7 +723,7 @@ fn process_stream_subset<R: Read>(
             rem -= n as u64;
             stream_pos += n as u64;
         }
-        if let Some((_, mut w)) = writer {
+        if let Some((_, ref mut w)) = writer {
             w.flush()?;
         }
 
@@ -837,7 +837,7 @@ pub fn unpack_nx6r(archive_path: &Path, output_dir: &Path) -> io::Result<Vec<Pat
                     CompressionMethod::Deflated
                 };
                 let opts = SimpleFileOptions::default().compression_method(method);
-                zw.start_file(&item.entry_name, opts).map_err(io::Error::other)?;
+                zw.start_file(item.entry_name.as_str(), opts).map_err(io::Error::other)?;
                 let mut rf = BufReader::new(File::open(&src_file)?);
                 io::copy(&mut rf, &mut zw)?;
             }
