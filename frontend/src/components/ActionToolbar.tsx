@@ -13,7 +13,7 @@
  *   - CLEAR    : reset all state (selectedPath, metrics, outputPath)
  */
 
-const ARCHIVE_EXTS = ["nxs", "nxs6", "lz"];
+const ARCHIVE_EXTS = ["nxs", "nxs6", "nx6r", "lz"];
 
 export function looksLikeArchive(path: string): boolean {
   const ext = (path.split(".").pop() ?? "").toLowerCase();

@@ -85,7 +85,7 @@ function isInspectable(name: string | null): "tar" | "solid" | "zip" | "7z" | "r
   if (!name) return null;
   const lower = name.toLowerCase();
   if (lower.endsWith(".tar")) return "tar";
-  if (lower.endsWith(".nxs6") || lower.endsWith(".nxs")) return "solid";
+  if (lower.endsWith(".nxs6") || lower.endsWith(".nx6r") || lower.endsWith(".nxs")) return "solid";
   // Sprint 5.7.x — WinRAR-compatible archives. The backend
   // dispatches .zip / .7z / .rar to the external readers
   // (`external_archive::*`). The frontend uses the same
@@ -468,7 +468,7 @@ export function DecompressView({
           // .7z, .rar alongside our own formats so users who
           // double-click an explorer window full of mixed archives
           // can pick anything in one go.
-          { name: "All archives (incl. WinRAR)", extensions: ["zip", "7z", "rar", "tar", "nxs", "nxs6", "nxe", "nxr", "lz", "nxar"] },
+          { name: "All archives (incl. WinRAR)", extensions: ["zip", "7z", "rar", "tar", "nxs", "nxs6", "nx6r", "nxe", "nxr", "lz", "nxar"] },
           { name: "All files", extensions: ["*"] },
         ],
       });

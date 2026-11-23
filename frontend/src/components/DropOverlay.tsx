@@ -41,6 +41,7 @@ const ARCHIVE_EXTS = new Set([
   "tar",
   "nxs",
   "nxs6",
+  "nx6r",
   "nxar",
   "nxe",
   "nxr",
