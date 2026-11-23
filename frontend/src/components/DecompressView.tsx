@@ -960,11 +960,11 @@ export function DecompressView({
             <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-400">
               <span className={info ? "text-emerald-400" : "text-cyan-300"}>TOC</span>
               <span>→</span>
-              <span className={running ? "text-cyan-300 font-semibold" : done ? "text-emerald-400" : ""}>Descomprimir XZ</span>
+              <span className={busy ? "text-cyan-300 font-semibold" : progress?.phase === "done" ? "text-emerald-400" : ""}>Descomprimir XZ</span>
               <span>→</span>
-              <span className={done ? "text-emerald-400" : ""}>SHA-256</span>
+              <span className={progress?.phase === "done" ? "text-emerald-400" : ""}>SHA-256</span>
               <span>→</span>
-              <span className={done ? "text-emerald-400 font-semibold" : ""}>Extraído</span>
+              <span className={progress?.phase === "done" ? "text-emerald-400 font-semibold" : ""}>Extraído</span>
             </div>
           </div>
         )}
