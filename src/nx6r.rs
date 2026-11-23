@@ -685,8 +685,10 @@ fn process_stream_subset<R: Read>(
     for entry in sorted {
         if entry.offset > stream_pos {
             let mut to_skip = entry.offset - stream_pos;
+            let max_buf = buf.len() as u64;
             while to_skip > 0 {
-                let n = xz.read(&mut buf[..(to_skip.min(buf.len() as u64) as usize)])?;
+                let to_read = to_skip.min(max_buf) as usize;
+                let n = xz.read(&mut buf[..to_read])?;
                 if n == 0 {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF skipping"));
                 }
