@@ -367,7 +367,9 @@ export function DecompressView({
               inspectable === "tar"
                 ? "TAR"
                 : inspectable === "solid"
-                  ? "NXS6"
+                  ? archivePath?.toLowerCase().endsWith(".nx6r")
+                    ? "NX6R"
+                    : "NXS6"
                   : inspectable === "zip"
                     ? "ZIP"
                     : inspectable === "7z"
@@ -942,6 +944,27 @@ export function DecompressView({
                   </div>
                 </details>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* Nexus NX6R / NXS6 pipeline indicator */}
+        {archivePath && (archivePath.toLowerCase().endsWith(".nx6r") || archivePath.toLowerCase().endsWith(".nxs6")) && (
+          <div className="mb-4 rounded-xl border border-cyan-500/20 bg-cyan-500/[0.06] px-4 py-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="inline-block w-2 h-2 rounded-full bg-cyan-400" />
+              <span className="text-xs font-semibold text-cyan-300">
+                Motor Nexus • {archivePath.toLowerCase().endsWith(".nx6r") ? "NX6R" : "NXS6"}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-400">
+              <span className={info ? "text-emerald-400" : "text-cyan-300"}>TOC</span>
+              <span>→</span>
+              <span className={running ? "text-cyan-300 font-semibold" : done ? "text-emerald-400" : ""}>Descomprimir XZ</span>
+              <span>→</span>
+              <span className={done ? "text-emerald-400" : ""}>SHA-256</span>
+              <span>→</span>
+              <span className={done ? "text-emerald-400 font-semibold" : ""}>Extraído</span>
             </div>
           </div>
         )}
