@@ -145,15 +145,51 @@ fn ext_of(name: &str) -> String {
         .unwrap_or_default()
 }
 
-fn classify_unit(name: &str) -> UnitCategory {
+fn stem_of(name: &str) -> String {
+    Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_known_compressible_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        ".dex" | ".so" | ".arsc" | ".xml" | ".json" | ".dll" | ".exe" | ".txt" | ".js" | ".css" | ".html" | ".obb"
+    )
+}
+
+fn shannon_entropy(sample: &[u8]) -> f64 {
+    if sample.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u64; 256];
+    for &b in sample {
+        counts[b as usize] += 1;
+    }
+    let n = sample.len() as f64;
+    let mut ent = 0.0f64;
+    for &c in &counts {
+        if c > 0 {
+            let p = (c as f64) / n;
+            ent -= p * p.log2();
+        }
+    }
+    ent
+}
+
+fn classify_unit_with_sample(name: &str, sample: &[u8]) -> UnitCategory {
     let low = name.to_ascii_lowercase();
     let ext = ext_of(&low);
-    if is_media_fast_ext(&ext) {
+    if is_media_fast_ext(&ext) || ext == ".usm" || ext == ".awb" {
         UnitCategory::MediaFast
     } else if ext == ".exe" || ext == ".dll" || (ext == ".so" && low.contains("/x86")) {
         UnitCategory::BcjX86
     } else if ext == ".so" && low.contains("/armeabi") {
         UnitCategory::BcjArm
+    } else if !sample.is_empty() && !is_known_compressible_ext(&ext) && shannon_entropy(sample) >= 7.85 {
+        UnitCategory::MediaFast
     } else {
         UnitCategory::General
     }
@@ -364,10 +400,15 @@ pub fn pack_nx6r(
                     }
                     let mut hasher = Sha256::new();
                     let mut entry_size = 0u64;
+                    let mut sample_buf = Vec::new();
                     loop {
                         let n = zf.read(&mut buf)?;
                         if n == 0 {
                             break;
+                        }
+                        if sample_buf.len() < 65536 {
+                            let take = (65536 - sample_buf.len()).min(n);
+                            sample_buf.extend_from_slice(&buf[..take]);
                         }
                         hasher.update(&buf[..n]);
                         entry_size += n as u64;
@@ -389,7 +430,7 @@ pub fn pack_nx6r(
                         uncompressed_size: entry_size,
                     });
                     units.push(PackUnit {
-                        category: classify_unit(&vname),
+                        category: classify_unit_with_sample(&vname, &sample_buf),
                         name: vname,
                         source: UnitSource::ZipEntry {
                             zip_path: disk_path.clone(),
@@ -407,10 +448,15 @@ pub fn pack_nx6r(
                 let mut hasher = Sha256::new();
                 let mut f = BufReader::with_capacity(256 * 1024, File::open(&disk_path)?);
                 let mut file_size = 0u64;
+                let mut sample_buf = Vec::new();
                 loop {
                     let n = f.read(&mut buf)?;
                     if n == 0 {
                         break;
+                    }
+                    if sample_buf.len() < 65536 {
+                        let take = (65536 - sample_buf.len()).min(n);
+                        sample_buf.extend_from_slice(&buf[..take]);
                     }
                     hasher.update(&buf[..n]);
                     file_size += n as u64;
@@ -418,7 +464,7 @@ pub fn pack_nx6r(
                 let digest: [u8; 32] = hasher.finalize().into();
                 sha_list.push((rel_name.clone(), digest));
                 units.push(PackUnit {
-                    category: classify_unit(&rel_name),
+                    category: classify_unit_with_sample(&rel_name, &sample_buf),
                     name: rel_name,
                     source: UnitSource::Disk(disk_path),
                     size: file_size,
@@ -427,75 +473,96 @@ pub fn pack_nx6r(
             }
         }
 
-        // Group by (category, extension, name) for maximum solid dictionary match density
+        // Solid Ordering: group by (category, extension, stem, full_path)
         units.sort_by(|a, b| {
             let ca = a.category as u8;
             let cb = b.category as u8;
             ca.cmp(&cb)
                 .then_with(|| ext_of(&a.name).cmp(&ext_of(&b.name)))
+                .then_with(|| stem_of(&a.name).cmp(&stem_of(&b.name)))
                 .then_with(|| a.name.cmp(&b.name))
         });
 
-        let requested = threads.unwrap_or_else(|| {
-            if units.len() >= 4 && total_raw_bytes >= 4 * 1024 * 1024 {
-                rayon::current_num_threads().clamp(2, 6)
-            } else {
-                1
-            }
-        });
-        let n_workers = ram::clamp_threads_for_ram(requested, preset).min(units.len().max(1));
+        let (group_a, group_b): (Vec<PackUnit>, Vec<PackUnit>) = units
+            .into_iter()
+            .partition(|u| u.category != UnitCategory::MediaFast);
+        let compressible_bytes: u64 = group_a.iter().map(|u| u.size).sum();
 
-        let mut toc_entries: Vec<TocEntry> = Vec::with_capacity(units.len());
+        let avail_mb = ram::available_memory_mb().unwrap_or(4096);
+        let mut eff_preset = preset;
+        if compressible_bytes >= 32 * 1024 * 1024 && avail_mb >= 2048 && preset >= 6 {
+            eff_preset = eff_preset.max(8);
+        } else if compressible_bytes >= 16 * 1024 * 1024 && avail_mb >= 1024 && preset >= 5 {
+            eff_preset = eff_preset.max(7);
+        }
+        eff_preset = ram::clamp_preset_for_ram(eff_preset, Some(avail_mb));
+
+        let n_a = if let Some(req_t) = threads {
+            ram::clamp_threads_for_ram(req_t, eff_preset).min(group_a.len().max(1))
+        } else if compressible_bytes <= 192 * 1024 * 1024 || group_a.len() < 4 {
+            1
+        } else {
+            let target = ((compressible_bytes + (96 * 1024 * 1024 - 1)) / (96 * 1024 * 1024)) as usize;
+            let max_w = ram::clamp_threads_for_ram(rayon::current_num_threads().clamp(2, 6), eff_preset);
+            target.clamp(2, max_w.min(group_a.len()))
+        };
+
+        let mut toc_entries: Vec<TocEntry> = Vec::with_capacity(group_a.len() + group_b.len());
         let mut chunk_metas: Vec<ChunkMeta> = Vec::new();
         let payload_bytes: Vec<u8>;
 
-        if n_workers <= 1 {
-            let (compressed, mut local_toc, _) = compress_xz_stream(UnitCategory::General, preset, &units)?;
+        let mut jobs: Vec<(UnitCategory, Vec<PackUnit>)> = Vec::new();
+        if !group_a.is_empty() {
+            if n_a <= 1 {
+                if compressible_bytes <= 192 * 1024 * 1024 {
+                    jobs.push((UnitCategory::General, group_a));
+                } else {
+                    let mut by_cat: HashMap<UnitCategory, Vec<PackUnit>> = HashMap::new();
+                    for u in group_a {
+                        by_cat.entry(u.category).or_default().push(u);
+                    }
+                    for (c, v) in by_cat {
+                        jobs.push((c, v));
+                    }
+                }
+            } else {
+                let mut sub: Vec<Vec<PackUnit>> = vec![Vec::new(); n_a];
+                let mut sub_sizes = vec![0u64; n_a];
+                for u in group_a {
+                    let idx = sub_sizes
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|&(_, s)| s)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    sub_sizes[idx] += u.size;
+                    sub[idx].push(u);
+                }
+                for b in sub {
+                    if !b.is_empty() {
+                        jobs.push((UnitCategory::General, b));
+                    }
+                }
+            }
+        }
+        if !group_b.is_empty() {
+            jobs.push((UnitCategory::MediaFast, group_b));
+        }
+
+        if jobs.len() <= 1 && threads != Some(1) {
+            let (cat, only_units) = jobs.into_iter().next().unwrap_or((UnitCategory::General, Vec::new()));
+            let (compressed, mut local_toc, _) = compress_xz_stream(cat, eff_preset, &only_units)?;
             for e in &mut local_toc {
                 e.chunk_id = 0xFF;
             }
             toc_entries.extend(local_toc);
             payload_bytes = compressed;
         } else {
-            let mut by_cat: HashMap<UnitCategory, Vec<PackUnit>> = HashMap::new();
-            for u in units {
-                by_cat.entry(u.category).or_default().push(u);
-            }
-            let mut jobs: Vec<(UnitCategory, Vec<PackUnit>)> = Vec::new();
-            for (cat, cat_units) in by_cat {
-                let cat_bytes: u64 = cat_units.iter().map(|u| u.size).sum();
-                let share = ((n_workers as f64) * (cat_bytes as f64 / total_raw_bytes.max(1) as f64))
-                    .round()
-                    .max(1.0) as usize;
-                let share = share.min(cat_units.len()).min(n_workers);
-                if share <= 1 {
-                    jobs.push((cat, cat_units));
-                } else {
-                    let mut sub: Vec<Vec<PackUnit>> = vec![Vec::new(); share];
-                    let mut sub_sizes = vec![0u64; share];
-                    for u in cat_units {
-                        let idx = sub_sizes
-                            .iter()
-                            .enumerate()
-                            .min_by_key(|&(_, s)| s)
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        sub_sizes[idx] += u.size;
-                        sub[idx].push(u);
-                    }
-                    for b in sub {
-                        if !b.is_empty() {
-                            jobs.push((cat, b));
-                        }
-                    }
-                }
-            }
-
             let compressed_jobs: Vec<io::Result<(usize, Vec<u8>, Vec<TocEntry>, u64)>> = jobs
                 .into_par_iter()
                 .enumerate()
                 .map(|(cid, (cat, bucket))| {
-                    let (bytes, mut ltoc, uncomp) = compress_xz_stream(cat, preset, &bucket)?;
+                    let (bytes, mut ltoc, uncomp) = compress_xz_stream(cat, eff_preset, &bucket)?;
                     for e in &mut ltoc {
                         e.chunk_id = cid as u8;
                     }
