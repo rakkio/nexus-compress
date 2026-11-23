@@ -179,7 +179,54 @@ fn shannon_entropy(sample: &[u8]) -> f64 {
     ent
 }
 
-fn classify_unit_with_sample(name: &str, sample: &[u8]) -> UnitCategory {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackProfile {
+    Archive,
+    Mobile,
+    Fast,
+    Ultra,
+}
+
+impl PackProfile {
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "mobile" => Self::Mobile,
+            "fast" => Self::Fast,
+            "ultra" => Self::Ultra,
+            _ => Self::Archive,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkStat {
+    pub chunk_id: usize,
+    pub role: String,
+    pub entries: usize,
+    pub raw_bytes: u64,
+    pub compressed_bytes: u64,
+    pub preset: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackStats {
+    pub profile: PackProfile,
+    pub preset: u32,
+    pub raw_total_bytes: u64,
+    pub compressible_bytes: u64,
+    pub incompressible_bytes: u64,
+    pub group_a_comp: u64,
+    pub group_b_comp: u64,
+    pub out_bytes: u64,
+    pub sha256_hex: String,
+    pub chunks: Vec<ChunkStat>,
+    pub top_entries: Vec<(String, u64)>,
+}
+
+fn classify_unit_with_sample(name: &str, sample: &[u8], size: u64) -> UnitCategory {
+    if size < 128 * 1024 {
+        return UnitCategory::General;
+    }
     let low = name.to_ascii_lowercase();
     let ext = ext_of(&low);
     if is_media_fast_ext(&ext) || ext == ".usm" || ext == ".awb" {
@@ -311,12 +358,24 @@ fn compress_xz_stream(cat: UnitCategory, preset: u32, bucket: &[PackUnit]) -> io
 }
 
 pub fn pack_nx6r(
-    source_path: &Path,
+    source_path: Path,
     output_path: &Path,
     preset: u32,
     unpack_apks: bool,
     threads: Option<usize>,
 ) -> io::Result<(u64, u64, String)> {
+    let stats = pack_nx6r_with_profile(source_path, output_path, preset, unpack_apks, threads, PackProfile::Archive)?;
+    Ok((stats.raw_total_bytes, stats.out_bytes, stats.sha256_hex))
+}
+
+pub fn pack_nx6r_with_profile(
+    source_path: &Path,
+    output_path: &Path,
+    preset: u32,
+    unpack_apks: bool,
+    threads: Option<usize>,
+    profile: PackProfile,
+) -> io::Result<PackStats> {
     if !source_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -336,7 +395,7 @@ pub fn pack_nx6r(
         let _ = fs::remove_dir_all(&tmp_bundle_dir);
     }
 
-    let result = (|| -> io::Result<(u64, u64, String)> {
+    let result = (|| -> io::Result<PackStats> {
         let mut raw_files: Vec<(PathBuf, String)> = Vec::new();
         if source_path.is_file() {
             let fname = source_path
@@ -430,7 +489,7 @@ pub fn pack_nx6r(
                         uncompressed_size: entry_size,
                     });
                     units.push(PackUnit {
-                        category: classify_unit_with_sample(&vname, &sample_buf),
+                        category: classify_unit_with_sample(&vname, &sample_buf, entry_size),
                         name: vname,
                         source: UnitSource::ZipEntry {
                             zip_path: disk_path.clone(),
@@ -464,7 +523,7 @@ pub fn pack_nx6r(
                 let digest: [u8; 32] = hasher.finalize().into();
                 sha_list.push((rel_name.clone(), digest));
                 units.push(PackUnit {
-                    category: classify_unit_with_sample(&rel_name, &sample_buf),
+                    category: classify_unit_with_sample(&rel_name, &sample_buf, file_size),
                     name: rel_name,
                     source: UnitSource::Disk(disk_path),
                     size: file_size,
@@ -473,33 +532,46 @@ pub fn pack_nx6r(
             }
         }
 
-        // Solid Ordering: group by (category, extension, stem, full_path)
-        units.sort_by(|a, b| {
-            let ca = a.category as u8;
-            let cb = b.category as u8;
-            ca.cmp(&cb)
-                .then_with(|| ext_of(&a.name).cmp(&ext_of(&b.name)))
+        let mut top_entries: Vec<(String, u64)> = units.iter().map(|u| (u.name.clone(), u.size)).collect();
+        top_entries.sort_by(|a, b| b.1.cmp(&a.1));
+        top_entries.truncate(10);
+
+        let (mut group_a, mut group_b): (Vec<PackUnit>, Vec<PackUnit>) = units
+            .into_iter()
+            .partition(|u| u.category != UnitCategory::MediaFast);
+
+        // ABI Affinity + Solid Ordering: keep all ABI variants of the same .so & classes*.dex together
+        group_a.sort_by(|a, b| {
+            ext_of(&a.name)
+                .cmp(&ext_of(&b.name))
                 .then_with(|| stem_of(&a.name).cmp(&stem_of(&b.name)))
                 .then_with(|| a.name.cmp(&b.name))
         });
+        group_b.sort_by(|a, b| ext_of(&a.name).cmp(&ext_of(&b.name)).then_with(|| a.name.cmp(&b.name)));
 
-        let (group_a, group_b): (Vec<PackUnit>, Vec<PackUnit>) = units
-            .into_iter()
-            .partition(|u| u.category != UnitCategory::MediaFast);
         let compressible_bytes: u64 = group_a.iter().map(|u| u.size).sum();
+        let incompressible_bytes: u64 = group_b.iter().map(|u| u.size).sum();
 
         let avail_mb = ram::available_memory_mb().unwrap_or(4096);
-        let mut eff_preset = preset;
-        if compressible_bytes >= 32 * 1024 * 1024 && avail_mb >= 2048 && preset >= 6 {
-            eff_preset = eff_preset.max(8);
-        } else if compressible_bytes >= 16 * 1024 * 1024 && avail_mb >= 1024 && preset >= 5 {
-            eff_preset = eff_preset.max(7);
-        }
+        let (mut eff_preset, solid_single_cap) = match profile {
+            PackProfile::Mobile => (preset.min(7), 192 * 1024 * 1024),
+            PackProfile::Fast => (preset.min(3), 96 * 1024 * 1024),
+            PackProfile::Ultra => (if avail_mb >= 1536 { 9 } else { preset.max(7) }, 384 * 1024 * 1024),
+            PackProfile::Archive => {
+                let mut p = preset;
+                if compressible_bytes >= 32 * 1024 * 1024 && avail_mb >= 2048 && preset >= 6 {
+                    p = p.max(8);
+                } else if compressible_bytes >= 16 * 1024 * 1024 && avail_mb >= 1024 && preset >= 5 {
+                    p = p.max(7);
+                }
+                (p, 224 * 1024 * 1024)
+            }
+        };
         eff_preset = ram::clamp_preset_for_ram(eff_preset, Some(avail_mb));
 
         let n_a = if let Some(req_t) = threads {
             ram::clamp_threads_for_ram(req_t, eff_preset).min(group_a.len().max(1))
-        } else if compressible_bytes <= 192 * 1024 * 1024 || group_a.len() < 4 {
+        } else if compressible_bytes <= solid_single_cap || group_a.len() < 4 {
             1
         } else {
             let target = ((compressible_bytes + (96 * 1024 * 1024 - 1)) / (96 * 1024 * 1024)) as usize;
@@ -509,22 +581,13 @@ pub fn pack_nx6r(
 
         let mut toc_entries: Vec<TocEntry> = Vec::with_capacity(group_a.len() + group_b.len());
         let mut chunk_metas: Vec<ChunkMeta> = Vec::new();
+        let mut chunk_stats: Vec<ChunkStat> = Vec::new();
         let payload_bytes: Vec<u8>;
 
         let mut jobs: Vec<(UnitCategory, Vec<PackUnit>)> = Vec::new();
         if !group_a.is_empty() {
             if n_a <= 1 {
-                if compressible_bytes <= 192 * 1024 * 1024 {
-                    jobs.push((UnitCategory::General, group_a));
-                } else {
-                    let mut by_cat: HashMap<UnitCategory, Vec<PackUnit>> = HashMap::new();
-                    for u in group_a {
-                        by_cat.entry(u.category).or_default().push(u);
-                    }
-                    for (c, v) in by_cat {
-                        jobs.push((c, v));
-                    }
-                }
+                jobs.push((UnitCategory::General, group_a));
             } else {
                 let mut sub: Vec<Vec<PackUnit>> = vec![Vec::new(); n_a];
                 let mut sub_sizes = vec![0u64; n_a];
@@ -551,13 +614,23 @@ pub fn pack_nx6r(
 
         if jobs.len() <= 1 && threads != Some(1) {
             let (cat, only_units) = jobs.into_iter().next().unwrap_or((UnitCategory::General, Vec::new()));
-            let (compressed, mut local_toc, _) = compress_xz_stream(cat, eff_preset, &only_units)?;
+            let n_entries = only_units.len();
+            let (compressed, mut local_toc, uncomp) = compress_xz_stream(cat, eff_preset, &only_units)?;
             for e in &mut local_toc {
                 e.chunk_id = 0xFF;
             }
             toc_entries.extend(local_toc);
+            chunk_stats.push(ChunkStat {
+                chunk_id: 0,
+                role: if cat == UnitCategory::MediaFast { "media_fast" } else { "general" }.to_string(),
+                entries: n_entries,
+                raw_bytes: uncomp,
+                compressed_bytes: compressed.len() as u64,
+                preset: if cat == UnitCategory::MediaFast { 1 } else { eff_preset },
+            });
             payload_bytes = compressed;
         } else {
+            let job_roles: Vec<UnitCategory> = jobs.iter().map(|(c, _)| *c).collect();
             let compressed_jobs: Vec<io::Result<(usize, Vec<u8>, Vec<TocEntry>, u64)>> = jobs
                 .into_par_iter()
                 .enumerate()
@@ -579,6 +652,15 @@ pub fn pack_nx6r(
             ok_jobs.sort_by_key(|j| j.0);
             for (cid, bytes, ltoc, uncomp) in ok_jobs {
                 let comp_sz = bytes.len() as u64;
+                let role_cat = job_roles[cid];
+                chunk_stats.push(ChunkStat {
+                    chunk_id: cid,
+                    role: if role_cat == UnitCategory::MediaFast { "media_fast" } else { "general" }.to_string(),
+                    entries: ltoc.len(),
+                    raw_bytes: uncomp,
+                    compressed_bytes: comp_sz,
+                    preset: if role_cat == UnitCategory::MediaFast { 1 } else { eff_preset },
+                });
                 chunk_metas.push(ChunkMeta {
                     chunk_id: cid as u8,
                     payload_offset: payload_off,
@@ -646,7 +728,21 @@ pub fn pack_nx6r(
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect::<String>();
-        Ok((total_raw_bytes, out_size, hex))
+        let group_a_comp: u64 = chunk_stats.iter().filter(|c| c.role != "media_fast").map(|c| c.compressed_bytes).sum();
+        let group_b_comp: u64 = chunk_stats.iter().filter(|c| c.role == "media_fast").map(|c| c.compressed_bytes).sum();
+        Ok(PackStats {
+            profile,
+            preset: eff_preset,
+            raw_total_bytes: total_raw_bytes,
+            compressible_bytes,
+            incompressible_bytes,
+            group_a_comp,
+            group_b_comp,
+            out_bytes: out_size,
+            sha256_hex: hex,
+            chunks: chunk_stats,
+            top_entries,
+        })
     })();
 
     if tmp_bundle_dir.exists() {

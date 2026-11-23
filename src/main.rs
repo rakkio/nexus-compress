@@ -93,6 +93,8 @@ fn main() {
     let mut split_mb: Option<usize> = None;
     let mut out_opt: Option<String> = None;
     let mut threads_opt: Option<usize> = None;
+    let mut profile_opt: Option<String> = None;
+    let mut show_stats = false;
     let mut no_apk_unpack = false;
     let mut positional: Vec<String> = Vec::new();
     while let Some(a) = iter.next() {
@@ -114,6 +116,12 @@ fn main() {
             }
             "--threads" | "-t" => {
                 threads_opt = iter.next().and_then(|s| s.parse().ok());
+            }
+            "--profile" => {
+                profile_opt = iter.next().cloned();
+            }
+            "--stats" => {
+                show_stats = true;
             }
             "--no-apk-unpack" => {
                 no_apk_unpack = true;
@@ -158,30 +166,65 @@ fn main() {
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| input.with_extension("nxs"));
             let level = lzma_level.unwrap_or(6);
+            let prof = nexus_compress::nx6r::PackProfile::from_str_lossy(
+                profile_opt.as_deref().unwrap_or("archive"),
+            );
             let t0 = std::time::Instant::now();
-            match nexus_compress::nx6r::pack_nx6r(
+            match nexus_compress::nx6r::pack_nx6r_with_profile(
                 input,
                 &output_path,
                 level,
                 !no_apk_unpack,
                 threads_opt,
+                prof,
             ) {
-                Ok((raw_bytes, comp_bytes, sha)) => {
+                Ok(stats) => {
                     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    let saved_pct = if raw_bytes > 0 {
-                        (raw_bytes.saturating_sub(comp_bytes)) as f64 / raw_bytes as f64 * 100.0
+                    let saved_pct = if stats.raw_total_bytes > 0 {
+                        (stats.raw_total_bytes.saturating_sub(stats.out_bytes)) as f64
+                            / stats.raw_total_bytes as f64
+                            * 100.0
                     } else {
                         0.0
                     };
                     eprintln!(
                         "OK: {} ({} B -> {} B | ahorro {:.2}% | {:.0} ms | sha256={}...)",
                         output_path.display(),
-                        raw_bytes,
-                        comp_bytes,
+                        stats.raw_total_bytes,
+                        stats.out_bytes,
                         saved_pct,
                         ms,
-                        &sha[..12]
+                        &stats.sha256_hex[..12]
                     );
+                    if show_stats {
+                        let ga_pct = stats.group_a_comp as f64 / stats.compressible_bytes.max(1) as f64 * 100.0;
+                        let gb_pct = stats.group_b_comp as f64 / stats.incompressible_bytes.max(1) as f64 * 100.0;
+                        eprintln!(
+                            "--- STATS (profile={:?}, preset={}, chunks={}) ---",
+                            stats.profile,
+                            stats.preset,
+                            stats.chunks.len()
+                        );
+                        eprintln!(
+                            "Grupo A (solido):    {} B -> {} B ({:.2}%)",
+                            stats.compressible_bytes, stats.group_a_comp, ga_pct
+                        );
+                        eprintln!(
+                            "Grupo B (fast-path): {} B -> {} B ({:.2}%)",
+                            stats.incompressible_bytes, stats.group_b_comp, gb_pct
+                        );
+                        for c in &stats.chunks {
+                            let cpct = c.compressed_bytes as f64 / c.raw_bytes.max(1) as f64 * 100.0;
+                            eprintln!(
+                                "  Chunk {} [{} p={}]: {} entries | {} B -> {} B ({:.2}%)",
+                                c.chunk_id, c.role, c.preset, c.entries, c.raw_bytes, c.compressed_bytes, cpct
+                            );
+                        }
+                        eprintln!("Top 10 entradas mas grandes (raw):");
+                        for (name, sz) in &stats.top_entries {
+                            eprintln!("  {:>12} B  {}", sz, name);
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("ERROR: {e}");
