@@ -238,7 +238,10 @@ export function LandingPage({
             onClick={() => onNavigate("compress")}
             className="group relative rounded-3xl p-6 bg-white/[0.02] border-2 border-dashed border-white/[0.10] hover:border-cyan-500/40 hover:bg-cyan-500/[0.04] transition-all duration-200 text-left flex flex-col justify-between min-h-[220px]"
           >
-            <div className="flex justify-end">
+            <div className="flex justify-between items-start">
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-cyan-500/15 border border-cyan-500/30 text-cyan-300 text-[10px] tracking-wider uppercase font-semibold">
+                {t("home.dropzone.tag")}
+              </span>
               <div className="w-12 h-12 rounded-xl bg-blue-500/15 border border-blue-500/30 flex items-center justify-center text-blue-400 group-hover:scale-110 transition-transform duration-300">
                 <FolderOpen size={22} strokeWidth={1.5} />
               </div>

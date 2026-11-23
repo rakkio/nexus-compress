@@ -25,6 +25,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { type View } from "@/components/NeoTopBar";
 import { useLocale } from "@/components/LocaleProvider";
+import { useLocalStorage } from "@/lib/useLocalStorage";
 import { ArchivePreview, type Preview } from "@/components/ArchivePreview";
 
 const isTauri =
@@ -80,17 +81,27 @@ interface ArchiveExtractResp {
   total_bytes: number;
 }
 
-function isInspectable(name: string | null): "tar" | "solid" | null {
+function isInspectable(name: string | null): "tar" | "solid" | "zip" | "7z" | "rar" | null {
   if (!name) return null;
   const lower = name.toLowerCase();
   if (lower.endsWith(".tar")) return "tar";
   if (lower.endsWith(".nxs6") || lower.endsWith(".nxs")) return "solid";
+  // Sprint 5.7.x — WinRAR-compatible archives. The backend
+  // dispatches .zip / .7z / .rar to the external readers
+  // (`external_archive::*`). The frontend uses the same
+  // `p2p_archive_list_cmd` + ArchivePreview UX as .tar / .nxs6
+  // so no other component changes are needed.
+  if (lower.endsWith(".zip")) return "zip";
+  if (lower.endsWith(".7z")) return "7z";
+  if (lower.endsWith(".rar")) return "rar";
   return null;
 }
 
 export function DecompressView({
   onComplete,
   onNavigate,
+  pendingDropPath,
+  onConsumedDrop,
 }: {
   onComplete: (op: {
     kind: "decompress";
@@ -100,13 +111,21 @@ export function DecompressView({
     durationMs: number;
   }) => void;
   onNavigate: (v: View) => void;
+  /** Sprint 5.7.31 — fires from the global DropOverlay when the
+   *  user drops an archive anywhere in the app. The view should
+   *  load + peek it as if the user had picked it manually. */
+  pendingDropPath?: string | null;
+  onConsumedDrop?: () => void;
 }) {
   const { t } = useLocale();
+  // Sprint 5.7.31 — persist output directory across navigation
+  // (skips the homeDir/Downloads auto-init when the user has a
+  // previous choice in localStorage).
+  const [destDir, setDestDir] = useLocalStorage<string>("nexus.decompress.destDir", "");
+  const [destInitialized, setDestInitialized] = useState(false);
   const [archivePath, setArchivePath] = useState<string | null>(null);
   const [info, setInfo] = useState<ArchiveInspectInfo | null>(null);
   const [legacyInfo, setLegacyInfo] = useState<LegacyArchiveInfo | null>(null);
-  const [destDir, setDestDir] = useState<string>("");
-  const [destInitialized, setDestInitialized] = useState(false);
   const [busy, setBusy] = useState(false);
   const [peeking, setPeeking] = useState(false);
   // Sprint 5.7.2 hotfix #23: progress state mirrors CompressView's
@@ -143,6 +162,37 @@ export function DecompressView({
   // for the "✗ wrong password" inline error.
   const [unlocking, setUnlocking] = useState(false);
   const [unlockError, setUnlockError] = useState<string | null>(null);
+  // Sprint 5.7.x — UnRAR detection. We fetch this once on mount
+  // so we can show a banner if the user drops a .rar and we
+  // can't actually read it (UnRAR not installed). The backend
+  // returns either `{ path, version }` (found) or `{ path: null,
+  // reason_missing }` (not found).
+  const [unrarStatus, setUnrarStatus] = useState<{
+    path: string | null;
+    version: string | null;
+    reason_missing: string | null;
+  } | null>(null);
+
+  // Fetch UnRAR detection status on mount. Cheap (one `which`
+  // lookup), safe to call on every app startup.
+  useEffect(() => {
+    if (!isTauri) return;
+    (async () => {
+      try {
+        const r = await tauriInvoke<{
+          path: string | null;
+          version: string | null;
+          reason_missing: string | null;
+        }>("unrar_status_cmd", { req: {} });
+        setUnrarStatus(r);
+      } catch {
+        // Backend not built with the new command yet, or Tauri
+        // runtime error. Default to "unknown" — we just don't
+        // show the banner.
+        setUnrarStatus(null);
+      }
+    })();
+  }, []);
 
   // Adapter: LegacyArchiveInfo → Preview. The encrypted peek
   // returns `nxe-encrypted` / `nxr-encrypted` with files: [] and
@@ -210,9 +260,15 @@ export function DecompressView({
 
   const inspectable = isInspectable(archivePath);
 
-  // Resolve homeDir on mount
+  // Resolve homeDir on mount IF the user hasn't persisted a destination
+  // from a previous session (Sprint 5.7.31 — see CompressView for the
+  // matching change).
   useEffect(() => {
     if (!isTauri || destInitialized) return;
+    if (destDir && destDir.length > 0) {
+      setDestInitialized(true);
+      return;
+    }
     (async () => {
       try {
         const { homeDir, join } = await import("@tauri-apps/api/path");
@@ -225,6 +281,7 @@ export function DecompressView({
         setDestInitialized(true);
       }
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [destInitialized]);
 
   // Subscribe to the 'compress-progress' event from the Rust backend.
@@ -275,7 +332,7 @@ export function DecompressView({
       }
     })();
     return () => unlisten?.();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, []);
 
   // Peek archive on path change
@@ -301,13 +358,23 @@ export function DecompressView({
         req: { path: archivePath, offset: 0, limit: 500 },
       })
         .then((r) => {
+          // Sprint 5.7.x — WinRAR-compatible archives get their
+          // own display labels (uppercase for visual distinction).
+          // The UI's ArchivePreview uses archive_kind to pick the
+          // format icon.
           const inspect: ArchiveInspectInfo = {
             archive_kind:
               inspectable === "tar"
                 ? "TAR"
                 : inspectable === "solid"
                   ? "NXS6"
-                  : "Legacy single-stream",
+                  : inspectable === "zip"
+                    ? "ZIP"
+                    : inspectable === "7z"
+                      ? "7Z"
+                      : inspectable === "rar"
+                        ? "RAR"
+                        : "Legacy single-stream",
             n_files: r.total_files,
             total_bytes: r.total_bytes,
             entries: r.entries,
@@ -348,6 +415,17 @@ export function DecompressView({
     }
   }, []);
 
+  // Sprint 5.7.31 — accept a drop from the global DropOverlay.
+  // Same pattern as CompressView: fire once when `pendingDropPath`
+  // transitions to non-null, consume immediately so re-renders
+  // with the same value are no-ops.
+  useEffect(() => {
+    if (!pendingDropPath) return;
+    acceptPath(pendingDropPath);
+    onConsumedDrop?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingDropPath]);
+
   // Drag-drop
   const onDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -364,23 +442,11 @@ export function DecompressView({
     [acceptPath],
   );
 
-  useEffect(() => {
-    if (!isTauri) return;
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      try {
-        const eventMod = (window as any).__TAURI__?.event;
-        if (!eventMod?.listen) return;
-        unlisten = await eventMod.listen("tauri://drag-drop", (e: any) => {
-          const paths: string[] = e?.payload?.paths ?? [];
-          if (paths.length > 0) acceptPath(paths[0]);
-        });
-      } catch (e) {
-        console.error(e);
-      }
-    })();
-    return () => unlisten?.();
-  }, [acceptPath]);
+    // Sprint 5.7.32: removed the local Tauri `tauri://drag-drop`
+  // listener for the same reason as CompressView — it was
+  // duplicating DropOverlay's work and causing double-handling.
+  // The view now only reads from `pendingDropPath` (set by the
+  // global DropOverlay) which carries real OS paths.
 
   const onBrowse = useCallback(async () => {
     if (!isTauri) return;
@@ -398,8 +464,12 @@ export function DecompressView({
         multiple: false,
         directory: false,
         filters: [
+          // Sprint 5.7.x: WinRAR-compatible filter — show .zip,
+          // .7z, .rar alongside our own formats so users who
+          // double-click an explorer window full of mixed archives
+          // can pick anything in one go.
+          { name: "All archives (incl. WinRAR)", extensions: ["zip", "7z", "rar", "tar", "nxs", "nxs6", "nxe", "nxr", "lz", "nxar"] },
           { name: "All files", extensions: ["*"] },
-          { name: "NexusCompress archives", extensions: ["nxs", "nxs6", "nxe", "nxr", "lz", "nxar"] },
         ],
       });
       if (typeof result === "string") acceptPath(result);
@@ -893,6 +963,30 @@ export function DecompressView({
               >
                 {t("decompress.dest.change")}
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* Sprint 5.7.x — UnRAR-missing banner. Only renders when:
+            1. Backend ran the unrar_status_cmd and reported not-found
+            2. The current archive is a .rar file
+            The banner explains that extraction will fail and tells
+            the user how to fix it (install WinRAR or copy UnRAR.exe
+            into PATH). It's non-blocking — the user can still pick
+            a destination and click Extract; the backend will surface
+            a clear error if UnRAR is needed and missing. */}
+        {unrarStatus && !unrarStatus.path && archivePath?.toLowerCase().endsWith(".rar") && (
+          <div className="mb-6 panel p-4 border-amber-500/40 bg-amber-500/[0.06]">
+            <div className="flex items-start gap-3">
+              <span className="text-amber-400 text-lg shrink-0">⚠</span>
+              <div className="flex-1">
+                <div className="text-amber-200 text-[13px] font-medium mb-1">
+                  {t("decompress.warn.unrarMissing")}
+                </div>
+                <div className="text-amber-300/70 text-[12px] leading-relaxed">
+                  {t("decompress.warn.unrarMissingHint")}
+                </div>
+              </div>
             </div>
           </div>
         )}

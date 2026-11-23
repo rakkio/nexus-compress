@@ -244,3 +244,28 @@ mod tests {
         assert!(!s.contains(": number"));
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+//   Sprint 5.7.x+ — cold-start warmup
+// ──────────────────────────────────────────────────────────────────────────
+//
+// swc_core's parser + AST + codegen are lazy-initialized on the
+// first `minify()` call. For users who compress .ts/.tsx files
+// (the default `SwcAst` preprocessor path), that first call costs
+// ~1-3 s — visible as a frozen progress bar right after clicking
+// "Comprimir". This function does a throwaway minify on a tiny
+// inline source so the lazy state is built up *before* the user
+// clicks anything. Called once on app mount from the frontend.
+//
+// The warmup cost is ~1-3 s at app start (single-threaded, on a
+// background thread) but it makes the FIRST real compression
+// start instantly — no more "freezes for 2 s then goes".
+pub fn warmup() {
+    // Tiny realistic-looking JS source. The exact contents don't
+    // matter; what matters is that swc_core's parser, AST, and
+    // emitter all instantiate and compile their internal regex
+    // tables once. ~10 ms of "real" parse, but ~1-3 s of lazy
+    // initialization on cold start.
+    let dummy = b"const x = 1; function add(a: number, b: number) { return a + b; }";
+    let _ = minify(dummy);
+}

@@ -234,20 +234,32 @@ fn build_sparse_table(dense_data: &[u32], n_symbols: usize, scale_bits: u32) -> 
 /// splits these by reading the first 32 bytes as the bitmask and the
 /// remainder as the rANS table.
 pub fn sparse_rans_encode_u8(data: &[u8], scale_bits: u32) -> (Vec<u8>, Vec<u8>) {
+    // Sprint 5.7.31 — profile: this is called 4× per block (~10
+    // blocks/MB). Each call allocates a 32-byte bitmask, a remap
+    // Vec<u16>, a dense Vec<u32>, a frequency table, and a
+    // ByteRansEncSymbol cache. That's 5 fresh heap allocations
+    // per call × 40 per MB — see the rANS allocator pool patch
+    // in this sprint for the fix.
+    let outer_start = std::time::Instant::now();
     let (bitmask, _remap, dense_data) = sparse_bitmask_remap(data);
     if dense_data.is_empty() {
         // Empty stream: 32-byte bitmask + 0 table + 0 stream.
-        return (bitmask.to_vec(), Vec::new());
+        let section = bitmask.to_vec();
+        crate::profile::add_ns(&crate::profile::PROFILE.sparse_rans_ns, outer_start);
+        return (section, Vec::new());
     }
     let n_symbols = _remap.len();
     let table = build_sparse_table(&dense_data, n_symbols, scale_bits);
     let table_bytes = encode_table(&table);
+    let inner_start = std::time::Instant::now();
     let stream_bytes = rans_encode(&dense_data, &table);
+    crate::profile::add_ns(&crate::profile::PROFILE.rans_encode_ns, inner_start);
 
     // Combine bitmask + table into one section.
     let mut section = Vec::with_capacity(SPARSE_BITMASK_BYTES + table_bytes.len());
     section.extend_from_slice(&bitmask);
     section.extend_from_slice(&table_bytes);
+    crate::profile::add_ns(&crate::profile::PROFILE.sparse_rans_ns, outer_start);
     (section, stream_bytes)
 }
 

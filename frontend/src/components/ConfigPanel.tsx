@@ -5,8 +5,12 @@ import { useLocale } from "@/components/LocaleProvider";
 
 // ─── Types (still exported so SaveTarget / CompressView can import) ───
 
+// Sprint 5.7.x — removed the Strength type and the MODES / ModeMeta
+// metadata that drove the now-deleted "default compression mode"
+// cards in Settings. The Compress screen is where the user picks
+// the per-compression mode (Rapido/Balanceado/Ultra) — duplicating
+// the choice in Settings was dead surface area.
 export type Mode = "v4" | "v5-min" | "v6-solid";
-export type Strength = "fast" | "balanced" | "max";
 
 // ─── Tauri invoke helper ─────────────────────────────────────────
 
@@ -21,56 +25,6 @@ async function tauriInvoke<T>(
   const invoke = (window as any).__TAURI_INTERNALS__.invoke;
   return await invoke(cmd, args);
 }
-
-// ─── Mode metadata ───────────────────────────────────────────────
-
-interface ModeMeta {
-  id: Mode;
-  icon: string;
-  titleKey: "settings.compression.mode.v4.title" | "settings.compression.mode.v5-min.title" | "settings.compression.mode.v6-solid.title";
-  descKey: "settings.compression.mode.v4.desc" | "settings.compression.mode.v5-min.desc" | "settings.compression.mode.v6-solid.desc";
-  tag: string;
-  activeBg: string;
-  activeRing: string;
-  activeDot: string;
-  tagColor: string;
-}
-
-const MODES: ModeMeta[] = [
-  {
-    id: "v4",
-    icon: "⚡",
-    titleKey: "settings.compression.mode.v4.title",
-    descKey: "settings.compression.mode.v4.desc",
-    tag: "v4",
-    activeBg: "bg-amber-500/[0.08]",
-    activeRing: "border-amber-500/40",
-    activeDot: "bg-amber-400",
-    tagColor: "text-amber-300 bg-amber-500/10 border-amber-500/30",
-  },
-  {
-    id: "v5-min",
-    icon: "⚖️",
-    titleKey: "settings.compression.mode.v5-min.title",
-    descKey: "settings.compression.mode.v5-min.desc",
-    tag: "v5-min",
-    activeBg: "bg-cyan-500/[0.08]",
-    activeRing: "border-cyan-500/40",
-    activeDot: "bg-cyan-400",
-    tagColor: "text-cyan-300 bg-cyan-500/10 border-cyan-500/30",
-  },
-  {
-    id: "v6-solid",
-    icon: "🧬",
-    titleKey: "settings.compression.mode.v6-solid.title",
-    descKey: "settings.compression.mode.v6-solid.desc",
-    tag: "v6-solid",
-    activeBg: "bg-violet-500/[0.08]",
-    activeRing: "border-violet-500/40",
-    activeDot: "bg-violet-400",
-    tagColor: "text-violet-300 bg-violet-500/10 border-violet-500/30",
-  },
-];
 
 // ─── Tunnel mode metadata ────────────────────────────────────────
 
@@ -179,38 +133,28 @@ export function LanguagePanel() {
 }
 
 // ─── Compression panel ──────────────────────────────────────────
+//
+// Sprint 5.7.x — the per-compression mode/strength selectors used
+// to live here too, but CompressView already exposes them on the
+// compression screen itself (where the choice is actually made per-
+// file). Two settings on the same choice was duplicate surface
+// area; we removed it.
+//
+// What's left here is the engine **self-test** — a one-click
+// diagnostic that exercises every backend end-to-end and reports
+// "the engine works on your machine, with the codecs we ship".
+// Useful when something looks off (mysterious crashes, weird
+// ratio numbers) but not a default-toggle.
 
 export function CompressionPanel({
-  mode: modeProp,
-  strength: strengthProp,
-  onModeChange,
-  onStrengthChange,
   onSelfTest,
 }: {
-  mode?: Mode;
-  strength?: Strength;
-  onModeChange?: (m: Mode) => void;
-  onStrengthChange?: (s: Strength) => void;
   onSelfTest?: () => void;
 } = {}) {
   const { t } = useLocale();
 
-  const [modeInternal, setModeInternal] = useState<Mode>("v5-min");
-  const [strengthInternal, setStrengthInternal] = useState<Strength>("balanced");
   const [selfTestStatus, setSelfTestStatus] = useState<"idle" | "busy" | "ok" | "err">("idle");
   const [selfTestMsg, setSelfTestMsg] = useState("");
-
-  const mode = modeProp ?? modeInternal;
-  const strength = strengthProp ?? strengthInternal;
-
-  const setMode = (m: Mode) => {
-    setModeInternal(m);
-    onModeChange?.(m);
-  };
-  const setStrength = (s: Strength) => {
-    setStrengthInternal(s);
-    onStrengthChange?.(s);
-  };
 
   const handleSelfTest = async () => {
     setSelfTestStatus("busy");
@@ -226,73 +170,35 @@ export function CompressionPanel({
     }
   };
 
-  const strengthLabel = (s: Strength) => {
-    if (mode === "v4") return s === "max" ? "Premium" : "Fast";
-    return s === "fast" ? "−1" : s === "balanced" ? "−6" : "−9";
-  };
-
   return (
     <Section
       title={t("settings.section.compression")}
-      hint="Modo por defecto al comprimir. Se puede cambiar en cada compresión."
+      hint={t("settings.compression.engineHint")}
     >
-      {/* Mode cards */}
-      <div className="p-4 grid grid-cols-3 gap-3">
-        {MODES.map((m) => {
-          const active = mode === m.id;
-          return (
-            <button
-              key={m.id}
-              onClick={() => setMode(m.id)}
-              className={`relative text-left p-4 rounded-2xl border transition-all ${
-                active
-                  ? `${m.activeBg} ${m.activeRing}`
-                  : "bg-white/[0.02] border-white/[0.06] hover:border-white/[0.14] hover:bg-white/[0.04]"
-              }`}
-            >
-              {active && (
-                <span className={`absolute top-3 right-3 w-2 h-2 rounded-full ${m.activeDot}`} />
-              )}
-              <div className="text-2xl mb-3">{m.icon}</div>
-              <p className="text-white text-[14px] font-semibold mb-1 leading-tight">
-                {t(m.titleKey)}
-              </p>
-              <p className="text-zinc-500 text-[11.5px] leading-relaxed mb-3 min-h-[2.5em]">
-                {t(m.descKey)}
-              </p>
-              <span
-                className={`inline-flex items-center px-2 py-0.5 rounded-md border text-[10px] font-mono tracking-wider ${m.tagColor}`}
-              >
-                {m.tag}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Strength */}
-      <div className="px-5 pb-4 border-t border-white/[0.04] pt-4">
-        <p className="text-zinc-500 text-[11px] tracking-[0.15em] uppercase mb-3">
-          {t("settings.compression.strength")}
-        </p>
-        <div className="flex gap-2">
-          {(["fast", "balanced", "max"] as Strength[]).map((s) => {
-            const active = strength === s;
-            return (
-              <button
-                key={s}
-                onClick={() => setStrength(s)}
-                className={`flex-1 py-2.5 rounded-xl text-[13px] font-mono font-medium transition-all ${
-                  active
-                    ? "bg-cyan-500/20 border border-cyan-500/40 text-cyan-300"
-                    : "bg-white/[0.03] border border-white/[0.08] text-zinc-500 hover:text-zinc-200 hover:border-white/[0.18]"
-                }`}
-              >
-                {strengthLabel(s)}
-              </button>
-            );
-          })}
+      {/* Engine info card — replaces the mode/strength cards that
+          used to live here. Shows what the engine is doing per-
+          compression without letting the user toggle a "default"
+          (which is meaningless — CompressView has the live picker). */}
+      <div className="p-5 space-y-3">
+        <div className="flex items-baseline justify-between px-1">
+          <span className="text-zinc-500 text-[11px] tracking-[0.15em] uppercase">
+            {t("settings.compression.default")}
+          </span>
+          <span className="text-white text-[13px] font-mono font-medium">
+            {t("settings.compression.default.value")}
+          </span>
         </div>
+        <div className="flex items-baseline justify-between px-1">
+          <span className="text-zinc-500 text-[11px] tracking-[0.15em] uppercase">
+            {t("settings.compression.dict")}
+          </span>
+          <span className="text-white text-[13px] font-mono font-medium">
+            {t("settings.compression.dict.value")}
+          </span>
+        </div>
+        <p className="text-zinc-500 text-[11.5px] leading-relaxed pt-2 border-t border-white/[0.04] mt-2">
+          {t("settings.compression.perFileHint")}
+        </p>
       </div>
 
       {/* Self-test */}
@@ -557,28 +463,14 @@ export function AboutPanel() {
 // The new SettingsView uses the individual panels above instead.
 
 export function ConfigPanel({
-  mode,
-  strength,
-  onModeChange,
-  onStrengthChange,
   onSelfTest,
 }: {
-  mode?: Mode;
-  strength?: Strength;
-  onModeChange?: (m: Mode) => void;
-  onStrengthChange?: (s: Strength) => void;
   onSelfTest?: () => void;
 } = {}) {
   return (
     <div className="space-y-7">
       <LanguagePanel />
-      <CompressionPanel
-        mode={mode}
-        strength={strength}
-        onModeChange={onModeChange}
-        onStrengthChange={onStrengthChange}
-        onSelfTest={onSelfTest}
-      />
+      <CompressionPanel onSelfTest={onSelfTest} />
       <TunnelPanel />
       <AboutPanel />
     </div>

@@ -16,6 +16,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { type View } from "@/components/NeoTopBar";
 import { useLocale } from "@/components/LocaleProvider";
+import { useLocalStorage } from "@/lib/useLocalStorage";
 import {
   FolderOpen,
   Plus,
@@ -120,6 +121,8 @@ const MODES: {
 export function CompressView({
   onComplete,
   onNavigate,
+  pendingDropPath,
+  onConsumedDrop,
 }: {
   onComplete: (op: {
     kind: "compress";
@@ -129,24 +132,44 @@ export function CompressView({
     durationMs: number;
   }) => void;
   onNavigate: (v: View) => void;
+  /** When set, the view should pre-fill its file picker with this
+   *  path. Sprint 5.7.31 — fires from the global DropOverlay. */
+  pendingDropPath?: string | null;
+  onConsumedDrop?: () => void;
 }) {
   const { t } = useLocale();
+
+  // Sprint 5.7.31 — persist user-configurable form state across
+  // navigation. The files themselves are NOT persisted (we re-pick
+  // per session), and password is NEVER persisted (security).
+  // Keys namespaced under `nexus.compress.*` so SettingsView can
+  // override them later if needed.
+  const [mode, setMode] = useLocalStorage<Mode>("nexus.compress.mode", "ultra");
+  const [encrypt, setEncrypt] = useLocalStorage<boolean>("nexus.compress.encrypt", false);
+  const [recoveryLevel, setRecoveryLevel] = useLocalStorage<"off" | "low" | "high">(
+    "nexus.compress.recovery", "low"
+  );
+  // Sprint 5.7.x — output format. Default "nxs" keeps the existing
+  // UX (our own codec). "zip" routes to `compress_to_zip_cmd`
+  // which wraps the (raw, pre-LZMA) bytes in a .zip envelope with
+  // LZMA method 14 — WinRAR-compatible output.
+  const [outputFormat, setOutputFormat] = useLocalStorage<"nxs" | "zip">(
+    "nexus.compress.format", "nxs"
+  );
+
   const [files, setFiles] = useState<string[]>([]);
-  const [mode, setMode] = useState<Mode>("balanceado");
-  const [destDir, setDestDir] = useState<string>("");
+  // destDir: persistent IF the user has manually set one. The
+  // Tauri homeDir/Downloads auto-init runs on first mount only
+  // (when localStorage is empty) so we don't clobber an existing
+  // user choice on subsequent opens.
+  const [destDir, setDestDir] = useLocalStorage<string>("nexus.compress.destDir", "");
   const [destInitialized, setDestInitialized] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [pathInput, setPathInput] = useState("");
-  // Sprint 5.7.2: encryption orchestrator state. The password
-  // and recovery level flow into the `compress_target_cmd`
-  // Tauri call; if `password` is set, the backend routes to
-  // the encrypted pipeline (v4 + AES-256-GCM + optional
-  // Reed-Solomon).
-  const [encrypt, setEncrypt] = useState(false);
+  // Password is NOT persisted — only session state.
   const [password, setPassword] = useState<string>("");
-  const [recoveryLevel, setRecoveryLevel] = useState<"off" | "low" | "high">("low");
   const [showPwd, setShowPwd] = useState(false);
   // FolderOpen + Plus icons for the new btn-ghost / btn-primary buttons
   // are imported at the top of the file.
@@ -154,9 +177,16 @@ export function CompressView({
   const [toast, setToast] = useState<{ kind: "ok" | "err"; msg: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Initialize the destination to the real ~/Downloads path on mount.
+  // Initialize the destination to the real ~/Downloads path on mount
+  // IF the user hasn't persisted one. Sprint 5.7.31: when localStorage
+  // already holds a destDir (from a prior session), we skip the
+  // auto-init so the user's previous choice is preserved.
   useEffect(() => {
     if (!isTauri || destInitialized) return;
+    if (destDir && destDir.length > 0) {
+      setDestInitialized(true);
+      return;
+    }
     (async () => {
       try {
         const { homeDir, join } = await import("@tauri-apps/api/path");
@@ -169,6 +199,9 @@ export function CompressView({
         setDestInitialized(true);
       }
     })();
+    // We only care about destDir's initial value at mount; re-running
+    // when destDir changes would clobber user edits.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [destInitialized]);
 
   // Subscribe to the 'compress-progress' event from the Rust backend
@@ -215,6 +248,20 @@ export function CompressView({
     }
   }, []);
 
+  // Sprint 5.7.31 — accept a drop from the global DropOverlay.
+  // Fires once when `pendingDropPath` becomes a non-null value;
+  // we add it to the queue and immediately signal consumption so
+  // the parent can clear its pendingDrop state. Re-renders with
+  // the same path are no-ops (we only consume non-null → non-null
+  // transitions, handled by the parent via `consumeDrop`).
+  useEffect(() => {
+    if (!pendingDropPath) return;
+    acceptPaths([pendingDropPath]);
+    onConsumedDrop?.();
+    // We intentionally only react to `pendingDropPath` changing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingDropPath]);
+
   // Drag-and-drop
   const onDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -236,26 +283,14 @@ export function CompressView({
     }
   }, [acceptPaths]);
 
-  // Tauri drag-drop listener (gives absolute paths)
-  useEffect(() => {
-    if (!isTauri) return;
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      try {
-        const eventMod = (window as any).__TAURI__?.event;
-        if (!eventMod?.listen) return;
-        unlisten = await eventMod.listen("tauri://drag-drop", (e: any) => {
-          const paths: string[] = e?.payload?.paths ?? [];
-          if (paths.length > 0) acceptPaths(paths);
-        });
-      } catch (e) {
-        console.error(e);
-      }
-    })();
-    return () => {
-      if (unlisten) unlisten();
-    };
-  }, [acceptPaths]);
+  // Sprint 5.7.32: removed the local Tauri `tauri://drag-drop`
+  // listener — it was duplicating what the global DropOverlay does,
+  // and the two together would add the same file twice (once
+  // directly via the local listener, once via the pendingDrop
+  // effect after DropOverlay navigates + repopulates state).
+  // DropOverlay is now the single consumer of Tauri drag-drop
+  // events; this view only handles the HTML `onDrop` (fallback
+  // path for `next dev` mode where there's no Tauri runtime).
 
   // Sprint 5.6.29 hotfix #19: the previous call passed
   //   `filters: [{ name: "All files", extensions: ["*"] }]`
@@ -346,6 +381,45 @@ export function CompressView({
       return;
     }
     try {
+      // Sprint 5.7.x — WinRAR-compatible output path. When
+      // `outputFormat === "zip"`, route to `compress_to_zip_cmd`
+      // which wraps the input bytes in a .zip envelope with LZMA
+      // method 14 (WinRAR can open this natively). The encryption
+      // path is NOT supported for .zip output — .zip AES is a
+      // separate schema (WinZip) and would require a different
+      // pipeline; out of scope for Sprint 5.7.x.
+      if (outputFormat === "zip") {
+        const zipResult = await tauriInvoke<{
+          output_path: string;
+          input_bytes: number;
+          output_bytes: number;
+          ratio: number;
+        }>("compress_to_zip_cmd", {
+          req: {
+            input_path: inputPath,
+            backend: m.backend,
+            lzma_level: m.lzma,
+            // No output_dir — the backend defaults to "next to
+            // input with .zip extension", which is the most
+            // natural UX for a per-file archive.
+          },
+        });
+        const durationMs = Date.now() - startTime;
+        const savingsPct = Math.round((1 - zipResult.ratio) * 100);
+        setToast({
+          kind: "ok",
+          msg: `✓ ${inputFilename} → ${zipResult.output_path.split(/[\\/]/).pop()} (${savingsPct}% más pequeño) en ${(durationMs / 1000).toFixed(1)}s`,
+        });
+        onComplete({
+          kind: "compress",
+          filename: zipResult.output_path.split(/[\\/]/).pop() || inputFilename,
+          originalBytes: zipResult.input_bytes,
+          compressedBytes: zipResult.output_bytes,
+          durationMs,
+        });
+        setFiles([]);
+        return;
+      }
       const lastResult: CompressResult = await tauriInvoke("compress_target_cmd", {
         req: {
           path: inputPath,
@@ -613,6 +687,45 @@ export function CompressView({
               {t("compress.dest.change")}
             </button>
           </div>
+        </div>
+
+        {/* Sprint 5.7.x — output format picker. NXS = our own
+            codec (.nxs / .nxs6 / .lz); ZIP = WinRAR-compatible
+            LZMA-in-zip. The encryption panel disables itself when
+            ZIP is selected because WinZip AES is out of scope. */}
+        <div className="mb-4 panel p-3 flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <span className="metric-label flex items-center gap-2">
+              <span className="text-cyan-400">📦</span>
+              {t("compress.format.label")}
+            </span>
+            <div className="flex items-center gap-1 bg-zinc-900/60 rounded-lg p-0.5">
+              {(["nxs", "zip"] as const).map((fmt) => (
+                <button
+                  key={fmt}
+                  onClick={() => setOutputFormat(fmt)}
+                  disabled={busy}
+                  className={`px-3 py-1 text-[11px] font-medium rounded-md transition-all uppercase tracking-wider ${
+                    outputFormat === fmt
+                      ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
+                      : "text-zinc-500 hover:text-zinc-300 border border-transparent"
+                  } disabled:opacity-50`}
+                >
+                  {fmt}
+                </button>
+              ))}
+            </div>
+          </div>
+          <p className="text-zinc-500 text-[11px] leading-relaxed">
+            {outputFormat === "zip"
+              ? t("compress.format.zipHint")
+              : t("compress.format.nxsHint")}
+          </p>
+          {outputFormat === "zip" && encrypt && (
+            <p className="text-amber-400/80 text-[11px] leading-relaxed">
+              {t("compress.format.zipEncryptWarn")}
+            </p>
+          )}
         </div>
 
         {/* Sprint 5.7.2: encryption + recovery panel. Toggle to

@@ -1,8 +1,23 @@
 "use client";
 
+/**
+ * NeoDashboard — bottom status bar with the latest completed op.
+ *
+ * Sprint 5.7.32: expanded from a passive "read-only" footer to an
+ * actionable mini-toolbar:
+ *   - Click filename → jump to Recent
+ *   - Click the savings% → jump to Recent
+ *   - Click the folder icon → reveal the output in the OS file manager
+ *   - Click the X → dismiss (no-op until the next operation completes)
+ *
+ * Stays compact (`h-11`) so it doesn't eat vertical space, but the
+ * icons are real hit targets thanks to `p-1` on the button wrappers.
+ */
+
 import { useLocale } from "@/components/LocaleProvider";
 import { type View } from "@/components/NeoTopBar";
-import { Check, AlertCircle, ChevronRight } from "lucide-react";
+import { Check, AlertCircle, FolderOpen, X } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 
 export interface LastOp {
   filename: string;
@@ -22,12 +37,26 @@ function prettyBytes(n: number): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+const isTauri =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+async function revealInFinder(path: string) {
+  if (!isTauri) return;
+  try {
+    await invoke("reveal_in_finder_cmd", { path });
+  } catch {
+    /* fallback: do nothing — the Tauri shell might not be present */
+  }
+}
+
 export function NeoDashboard({
   op,
   onNavigate,
+  onDismiss,
 }: {
   op: LastOp | null;
   onNavigate?: (v: View) => void;
+  onDismiss?: () => void;
 }) {
   const { t } = useLocale();
 
@@ -74,7 +103,7 @@ export function NeoDashboard({
         <span className="text-zinc-500 shrink-0">{kindLabel}</span>
       </button>
 
-      {/* Right stats */}
+      {/* Right stats + actions */}
       <div className="flex items-center gap-4 shrink-0">
         <Stat label="t" value={`${durationSec.toFixed(1)}s`} />
         {op.compressedBytes != null && savings > 0 && (
@@ -90,6 +119,31 @@ export function NeoDashboard({
             <span className="text-zinc-700">→</span>
             <Stat label="" value={prettyBytes(outputSize)} color="cyan" />
           </>
+        )}
+        {/* Reveal-in-finder button — useful immediately after
+            compress/decompress to jump to the output file. */}
+        {op.filename && (
+          <button
+            onClick={() => revealInFinder(op.filename)}
+            title={t("recent.action.reveal")}
+            aria-label={t("recent.action.reveal")}
+            className="p-1 rounded-md text-zinc-500 hover:text-cyan-300 hover:bg-white/[0.05] transition-colors"
+          >
+            <FolderOpen size={13} />
+          </button>
+        )}
+        {/* Dismiss — clears the last-op state so the footer returns
+            to its empty hint. Auto-clears on next op anyway, but the
+            manual dismiss feels good when the user is done celebrating. */}
+        {onDismiss && (
+          <button
+            onClick={onDismiss}
+            title={t("palette.empty")}
+            aria-label="Dismiss"
+            className="p-1 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.05] transition-colors"
+          >
+            <X size={13} />
+          </button>
         )}
       </div>
     </footer>

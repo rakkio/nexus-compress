@@ -24,6 +24,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useLocale } from "@/components/LocaleProvider";
 import { useTheme } from "@/components/ThemeProvider";
+import { useLocalStorage } from "@/lib/useLocalStorage";
 import {
   Settings as SettingsIcon,
   Languages,
@@ -103,7 +104,10 @@ const SECTIONS: SectionDef[] = [
 
 export function SettingsView() {
   const { t } = useLocale();
-  const [active, setActive] = useState<SectionId>("interface");
+  // Sprint 5.7.31 — remember which section the user was on. When they
+  // navigate away (e.g. to Compress) and come back, the same tab is
+  // selected. Persisted per-user in localStorage.
+  const [active, setActive] = useLocalStorage<SectionId>("nexus.settings.active", "interface");
 
   return (
     <div className="flex-1 overflow-y-auto">

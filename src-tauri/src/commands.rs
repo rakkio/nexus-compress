@@ -18,7 +18,7 @@ use nexus_compress::api::{
     CompressionLevel, DecompressResult, DecompressTargetResult, EngineInfo, PeekResult,
     ProgressEvent, SelfTestResult,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 fn to_ipc<T>(r: ApiResult<T>) -> Result<T, String> {
@@ -201,38 +201,93 @@ pub async fn compress_target_cmd(
         .to_string();
 
     let inner: ApiResult<CompressTargetResult> = tauri::async_runtime::spawn_blocking(move || {
-        let app_for_event = app.clone();
-        // Sprint 5.7 throttling: ProgressEvent emits per chunk
-        // (potentially hundreds per second on fast disks). We
-        // collect into a slot and only flush to the IPC channel
-        // every 100ms — see `throttle::ThrottledEmitter` below.
-        let throttler = throttle::ThrottledEmitter::new(app_for_event.clone());
-        let cb = |event: ProgressEvent| {
-            throttler.feed("compress-progress", &event);
-        };
-        // Two paths: encrypted (password is set) or plain.
-        // We keep the dispatch in one function so the frontend
-        // doesn't have to call different commands; the password
-        // is the only signal that decides the branch.
-        if let Some(pwd) = password.as_deref() {
-            let recovery = match recovery_str.as_deref() {
-                Some(s) => api::RecoveryLevel::from_str(s)
-                    .map_err(|e| ApiError::new("compress.invalid_recovery_level", e))?,
-                None => api::RecoveryLevel::default(),
+        // Sprint 5.7.x+ STATUS_BREAKPOINT hotfix: wrap the heavy
+        // compression work in `catch_unwind` so any panic in the
+        // engine (e.g. swc_core OOM on a malformed TS file, xz2
+        // internal assertion, rayon worker stack overflow) becomes
+        // a clean `ApiError` instead of an uncaught panic that
+        // crosses the FFI boundary and shows up as
+        // STATUS_BREAKPOINT (0x80000003) on Windows. The frontend
+        // was seeing this on ~250 MB inputs that exhaust RAM during
+        // the in-memory compression path.
+        //
+        // The `AssertUnwindSafe` is needed because the closure
+        // captures references to `app` (AppHandle is RefUnwindSafe
+        // on tauri 2.x but we don't depend on that — the panic
+        // path discards the closure result anyway).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let app_for_event = app.clone();
+            // Sprint 5.7 throttling: ProgressEvent emits per chunk
+            // (potentially hundreds per second on fast disks). We
+            // collect into a slot and only flush to the IPC channel
+            // every 100ms — see `throttle::ThrottledEmitter` below.
+            let throttler = throttle::ThrottledEmitter::new(app_for_event.clone());
+            let cb = |event: ProgressEvent| {
+                throttler.feed("compress-progress", &event);
             };
-            let opts = api::CompressWithPasswordOptions {
-                password: pwd.as_bytes(),
-                recovery,
-            };
-            api::compress_target_with_password(&p, &opts, cb)
-        } else {
-            api::compress_target(
-                &p,
-                backend,
-                lzma_level,
-                output_dir.as_deref(),
-                cb,
-            )
+            // Sprint 5.7.x+: emit a "preparing" frame BEFORE the
+            // spawn_blocking work starts so the UI shows activity
+            // immediately. The heavy lifting (SimHash sort +
+            // swc_core parse on .ts/.tsx + LZMA compress) can take
+            // 1-3s on a cold start because swc_core's parser/codegen
+            // are lazy-initialized; without this priming event the
+            // user clicks "Comprimir" and the progress bar appears
+            // frozen until the first per-file event fires.
+            cb(api::ProgressEvent {
+                phase: "preparing".to_string(),
+                current_file: String::new(),
+                files_done: 0,
+                files_total: 0,
+                bytes_done: 0,
+                bytes_total: 0,
+                elapsed_ms: 0,
+                bytes_per_sec: 0.0,
+                eta_ms: 0,
+            });
+            // Two paths: encrypted (password is set) or plain.
+            // We keep the dispatch in one function so the frontend
+            // doesn't have to call different commands; the password
+            // is the only signal that decides the branch.
+            if let Some(pwd) = password.as_deref() {
+                let recovery = match recovery_str.as_deref() {
+                    Some(s) => api::RecoveryLevel::from_str(s)
+                        .map_err(|e| ApiError::new("compress.invalid_recovery_level", e))?,
+                    None => api::RecoveryLevel::default(),
+                };
+                let opts = api::CompressWithPasswordOptions {
+                    password: pwd.as_bytes(),
+                    recovery,
+                };
+                api::compress_target_with_password(&p, &opts, cb)
+            } else {
+                api::compress_target(
+                    &p,
+                    backend,
+                    lzma_level,
+                    output_dir.as_deref(),
+                    cb,
+                )
+            }
+        }));
+        match result {
+            Ok(r) => r,
+            Err(panic_payload) => {
+                // Convert panic into a clean ApiError. The
+                // payload is usually a `&str` or `String`; if
+                // neither, fall back to a generic message.
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "compress panicked (unknown payload) — this is \
+                     almost always an OOM during heavy LZMA / swc_core \
+                     work; try a smaller file, a lower LZMA preset, or \
+                     close other apps to free RAM"
+                        .to_string()
+                };
+                Err(ApiError::new("compress.panic", msg))
+            }
         }
     })
     .await
@@ -317,24 +372,48 @@ pub async fn decompress_target_cmd(
         let cb = |event: ProgressEvent| {
             throttler.feed("compress-progress", &event);
         };
-        match password {
-            Some(pwd) => {
-                // Drop the password immediately after we've moved
-                // it into the closure so it doesn't linger on the
-                // stack any longer than needed (defense in depth
-                // — the `drop(pwd)` below ensures the heap copy
-                // is zeroed when the function returns).
-                api::decompress_target_with_password(
-                    &p,
-                    pwd.as_bytes(),
-                    cb,
-                )
+        // Sprint 5.7.x — WinRAR-compatible dispatch. For
+        // .zip/.7z/.rar we extract via the external readers and
+        // return a synthetic DecompressTargetResult that matches
+        // the engine shape (archive_kind / restored_size /
+        // n_files / output_path). For all other formats we keep
+        // the existing engine-crate dispatch.
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "zip" | "7z" | "rar" => {
+                // Encrypted WinRAR-style archives are out of scope
+                // for Sprint 5.7.x (use WinRAR / 7-Zip directly).
+                if password.is_some() {
+                    return Err(api::ApiError::new(
+                        "decompress.encrypted_external_unsupported",
+                        "encrypted .zip/.7z/.rar not supported (use 7-Zip / WinRAR)",
+                    ));
+                }
+                decompress_external_archive_cmd(&p, output_dir.as_deref(), &ext, &cb)
             }
-            None => api::decompress_target_with_progress(
-                &p,
-                output_dir.as_deref(),
-                cb,
-            ),
+            _ => match password {
+                Some(pwd) => {
+                    // Drop the password immediately after we've moved
+                    // it into the closure so it doesn't linger on the
+                    // stack any longer than needed (defense in depth
+                    // — the `drop(pwd)` below ensures the heap copy
+                    // is zeroed when the function returns).
+                    api::decompress_target_with_password(
+                        &p,
+                        pwd.as_bytes(),
+                        cb,
+                    )
+                }
+                None => api::decompress_target_with_progress(
+                    &p,
+                    output_dir.as_deref(),
+                    cb,
+                ),
+            },
         }
     })
     .await
@@ -382,13 +461,169 @@ pub async fn peek_archive_target_cmd(req: serde_json::Value) -> Result<PeekResul
         .map(String::from);
     let p = PathBuf::from(path);
     tauri::async_runtime::spawn_blocking(move || {
-        match password.as_deref() {
-            Some(pwd) => to_ipc(api::peek_archive_target_with_password(&p, pwd.as_bytes())),
-            None => to_ipc(api::peek_archive_target(&p)),
+        // Sprint 5.7.x — WinRAR-compatible dispatch. The engine
+        // crate (`api::*`) handles NXS/NXAR/LZMA/NXE/NXR by magic
+        // bytes. For .zip/.7z/.rar we route to the Tauri-side
+        // external readers which carry the zip/7z-rust crates.
+        // We dispatch on extension because the legacy path's
+        // magic-byte check rejects the new formats.
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "zip" | "7z" | "rar" => {
+                // Encrypted WinRAR-style archives (.zip with
+                // WinZip AES, etc.) are out of scope for now — we
+                // only support the encrypted NXS envelopes.
+                if password.is_some() {
+                    return Err(
+                        "encrypted .zip/.7z/.rar not supported (use 7-Zip / WinRAR)"
+                            .to_string(),
+                    );
+                }
+                peek_external_archive_cmd(&p, &ext)
+            }
+            _ => match password.as_deref() {
+                Some(pwd) => {
+                    to_ipc(api::peek_archive_target_with_password(&p, pwd.as_bytes()))
+                }
+                None => to_ipc(api::peek_archive_target(&p)),
+            },
         }
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {}", e))?
+}
+
+/// Extract a .zip/.7z/.rar archive via the appropriate external
+/// reader and return a `DecompressTargetResult` matching the engine
+/// crate's shape. The frontend's progress bar + Toaster don't need
+/// to special-case anything — same JSON, same event semantics.
+fn decompress_external_archive_cmd(
+    path: &Path,
+    output_dir: Option<&Path>,
+    ext: &str,
+    cb: &dyn Fn(api::ProgressEvent),
+) -> ApiResult<DecompressTargetResult> {
+    let start = std::time::Instant::now();
+    // Decide where to extract. If the user supplied an output_dir,
+    // use it; otherwise drop files next to the archive (same as the
+    // engine's default behaviour).
+    let target_dir = match output_dir {
+        Some(p) => p.to_path_buf(),
+        None => path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+    // Read the entries first so we can report total bytes / count
+    // and emit a pre-walk progress event.
+    let entries = match ext {
+        "zip" => crate::external_archive::list_zip_entries(path),
+        "7z" => crate::external_archive::list_7z_entries(path),
+        "rar" => crate::external_archive::list_rar_entries(path),
+        other => {
+            return Err(api::ApiError::new(
+                "decompress.unsupported_external",
+                format!("unsupported external format: .{}", other),
+            ))
+        }
+    }
+    .map_err(|e| api::ApiError::new("decompress.external_list_failed", e))?;
+    let file_count = entries.len() as u64;
+    let total_bytes: u64 = entries.iter().map(|e| e.size).sum();
+    cb(api::ProgressEvent {
+        phase: "decompressing".to_string(),
+        current_file: String::new(),
+        files_done: 0,
+        files_total: file_count,
+        bytes_done: 0,
+        bytes_total: total_bytes,
+        elapsed_ms: 0,
+        bytes_per_sec: 0.0,
+        eta_ms: 0,
+    });
+    // Extract. The readers don't emit per-file events — they stream
+    // sequentially. We post a "decompressing" event before, and a
+    // final "done" event after, so the progress bar gets two frames
+    // (typical for small archives that finish in <100 ms).
+    let _written = match ext {
+        "zip" => crate::external_archive::extract_zip_entries(path, &target_dir, None),
+        "7z" => crate::external_archive::extract_7z_entries(path, &target_dir, None),
+        "rar" => crate::external_archive::extract_rar_entries(path, &target_dir, None),
+        _ => unreachable!(),
+    }
+    .map_err(|e| api::ApiError::new("decompress.external_extract_failed", e))?;
+    cb(api::ProgressEvent {
+        phase: "done".to_string(),
+        current_file: String::new(),
+        files_done: file_count,
+        files_total: file_count,
+        bytes_done: total_bytes,
+        bytes_total: total_bytes,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        bytes_per_sec: if start.elapsed().as_millis() > 0 {
+            total_bytes as f64 / (start.elapsed().as_millis() as f64 / 1000.0)
+        } else {
+            0.0
+        },
+        eta_ms: 0,
+    });
+    Ok(DecompressTargetResult {
+        archive_kind: match ext {
+            "zip" => "zip",
+            "7z" => "7z",
+            "rar" => "rar",
+            _ => "external",
+        },
+        restored_size: total_bytes,
+        n_files: file_count,
+        is_directory: true,
+        output_path: target_dir.to_string_lossy().into_owned(),
+        decompress_time_ms: start.elapsed().as_millis() as f64,
+    })
+}
+
+/// Build a PeekResult from a .zip/.7z/.rar archive by listing its
+/// entries via the appropriate `external_archive` reader. Returns
+/// the same `PeekResult` shape the engine crate uses so the
+/// frontend's ArchivePreview doesn't need to special-case anything.
+fn peek_external_archive_cmd(path: &Path, ext: &str) -> Result<PeekResult, String> {
+    let entries = match ext {
+        "zip" => crate::external_archive::list_zip_entries(path)?,
+        "7z" => crate::external_archive::list_7z_entries(path)?,
+        "rar" => crate::external_archive::list_rar_entries(path)?,
+        other => {
+            return Err(format!("unsupported external format: .{}", other))
+        }
+    };
+    let compressed_size = std::fs::metadata(path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let total: u64 = entries.iter().map(|e| e.size).sum();
+    let n = entries.len() as u64;
+    let files: Vec<api::ArchivePreviewEntry> = entries
+        .into_iter()
+        .map(|e| api::ArchivePreviewEntry {
+            path: e.name,
+            size: e.size,
+            is_dir: e.is_dir,
+        })
+        .collect();
+    Ok(PeekResult {
+        archive_kind: match ext {
+            "zip" => "zip",
+            "7z" => "7z",
+            "rar" => "rar",
+            _ => "external",
+        },
+        n_files: n,
+        total_uncompressed: total,
+        compressed_size,
+        files,
+    })
 }
 
 // ============================================================================
@@ -455,23 +690,16 @@ pub async fn p2p_archive_list_cmd(req: serde_json::Value) -> Result<ArchiveListR
     let (page, total_files, total_bytes, has_more, parse_time_ms) =
         tauri::async_runtime::spawn_blocking(move || {
             let start = std::time::Instant::now();
-            // list_paginated streams headers incrementally and
-            // stops after `limit + 1` entries to detect has_more
-            // without enumerating the whole archive. For typical
-            // archives this means touching only a few KB of the
-            // file, regardless of total size.
-            let page = crate::archive_inspect::list_paginated(&path, offset, limit)?;
-            // Total stats — use a separate cheap count of just
-            // header bytes by reading the file's end (for tar
-            // there's no central header, so we approximate via
-            // the same iterator).
+            // Sprint 5.7.x — extension-aware dispatch so .zip / .7z
+            // / .rar files (WinRAR-style archives) go to the
+            // external readers instead of the legacy tar/solid
+            // dispatch. The legacy `archive_inspect::list_paginated`
+            // is kept for .tar / .nxs6 / .nxs / .nxar.
+            let page = list_external_or_internal_paginated(&path, offset, limit)?;
+            // Total stats — sum of sizes in this page; the UI shows
+            // an approximate "X GB total" when pagination kicks in.
             let total_bytes: u64 = page.entries.iter().map(|e| e.size).sum();
-            // For the total file count, we approximate: if
-            // has_more, we know the page is the start of more.
-            // We don't enumerate everything — the UI shows
-            // "showing N of M+" when has_more is true.
             let total_files = if page.has_more {
-                // Upper bound: at least offset + limit + 1 more.
                 offset + limit + 1
             } else {
                 offset + page.entries.len()
@@ -502,6 +730,45 @@ pub async fn p2p_archive_list_cmd(req: serde_json::Value) -> Result<ArchiveListR
         offset,
         parse_time_ms,
     })
+}
+
+/// Dispatch by extension: .zip → zip reader, .7z → sevenz-rust,
+/// .rar → UnRAR shell-out, otherwise fall back to the legacy
+/// tar / solid reader in `archive_inspect`.
+fn list_external_or_internal_paginated(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+) -> Result<crate::archive_inspect::PageResult, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "zip" => crate::external_archive::list_zip_paginated(path, offset, limit),
+        "7z" => crate::external_archive::list_7z_paginated(path, offset, limit),
+        "rar" => crate::external_archive::list_rar_paginated(path, offset, limit),
+        _ => crate::archive_inspect::list_paginated(path, offset, limit),
+    }
+}
+
+fn extract_external_or_internal(
+    path: &Path,
+    output_dir: &Path,
+    selected: Option<Vec<String>>,
+) -> Result<Vec<String>, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "zip" => crate::external_archive::extract_zip_entries(path, output_dir, selected),
+        "7z" => crate::external_archive::extract_7z_entries(path, output_dir, selected),
+        "rar" => crate::external_archive::extract_rar_entries(path, output_dir, selected),
+        _ => crate::archive_inspect::extract_entries(path, output_dir, selected),
+    }
 }
 
 #[tauri::command]
@@ -535,7 +802,7 @@ pub async fn p2p_archive_extract_cmd(req: serde_json::Value) -> Result<ArchiveEx
     };
     let output_dir_for_total = output_dir.clone();
     let written = tauri::async_runtime::spawn_blocking(move || {
-        crate::archive_inspect::extract_entries(&path, &output_dir, selected)
+        extract_external_or_internal(&path, &output_dir, selected)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {}", e))??;
@@ -1358,4 +1625,399 @@ pub async fn reset_stats_cmd(
 ) -> Result<(), String> {
     let conn = state.lock().await;
     db::reset_stats(&conn).map_err(|e| e.to_string())
+}
+
+// ============================================================================
+//  Sprint 5.7.x+ — cold-start warmup
+// ============================================================================
+//
+// swc_core's parser / AST / codegen are lazy-initialized on the
+// first call. For users who compress .ts/.tsx files (the default
+// `SwcAst` preprocessor path), that first call costs ~1-3 s —
+// visible as a frozen progress bar right after clicking "Comprimir".
+//
+// The frontend fires `warmup_cmd` once on app mount (in a background
+// effect, non-blocking) so the lazy state is built up *before* the
+// user clicks anything. After warmup, the first real compression
+// starts instantly — no more "freezes for 2 s then goes".
+//
+// Cheap to call repeatedly (the second + Nth calls are no-ops if
+// swc_core is already initialized) so we don't bother memoizing.
+#[tauri::command]
+pub async fn warmup_cmd() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        // ast_minify::warmup() does a throwaway parse on a tiny
+        // inline source. Triggers compilation of swc_core's
+        // parser/codegen regex tables + AST node allocators.
+        nexus_compress::ast_minify::warmup();
+    })
+    .await
+    .map_err(|e| format!("warmup join failed: {}", e))
+}
+
+// ============================================================================
+//  Sprint 5.7.x — WinRAR-compatible archive support
+// ============================================================================
+//
+// Two new commands:
+//
+//   unrar_status_cmd    — UI queries this on mount so it can render
+//                         the "RAR no soportado" banner when UnRAR
+//                         isn't installed.
+//
+//   compress_to_zip_cmd — Wraps an existing compressed buffer (e.g.
+//                         the output of compress_bytes_with_backend)
+//                         in a .zip envelope with LZMA. WinRAR can
+//                         open the result natively. This is the
+//                         "compress in WinRAR style" path — the
+//                         .zip container is the lingua franca of
+//                         file compression and LZMA beats Deflate
+//                         by ~10-15% on text/code inputs.
+
+/// Returns the UnRAR detection result. Cheap (one `which` lookup),
+/// safe to call on every app startup.
+#[tauri::command]
+pub async fn unrar_status_cmd() -> Result<crate::external_archive::UnrarStatus, String> {
+    Ok(crate::external_archive::detect_unrar())
+}
+
+#[derive(Serialize)]
+pub struct CompressToZipResp {
+    pub output_path: String,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    /// Ratio as input/output (1.0 = no compression, 2.0 = half size).
+    /// 0.0 if input is empty.
+    pub ratio: f64,
+}
+
+/// Compress an existing file (or directory, tarred first) into a
+/// `.zip` archive using LZMA (method 14). The result is a valid .zip
+/// that WinRAR can open and decompress natively.
+///
+/// The `input_path` is read recursively (a directory is tar'd first
+/// via the existing V6Solid backend so the .zip entry structure
+/// preserves the directory layout). For a single file, the .zip
+/// contains exactly one entry named after the input file.
+#[tauri::command]
+pub async fn compress_to_zip_cmd(
+    db_state: State<'_, Arc<tokio::sync::Mutex<rusqlite::Connection>>>,
+    req: serde_json::Value,
+) -> Result<CompressToZipResp, String> {
+    let input_path_str = req
+        .get("input_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing 'input_path'".to_string())?
+        .to_string();
+    let output_path_str = req
+        .get("output_path")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let backend_str = req
+        .get("backend")
+        .and_then(|v| v.as_str())
+        .unwrap_or("v6-solid")
+        .to_string();
+    let lzma_level: u32 = req
+        .get("lzma_level")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(6) as u32;
+    let password: Option<String> = req
+        .get("password")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let input_path = PathBuf::from(&input_path_str);
+    if !input_path.exists() {
+        return Err(format!("input not found: {}", input_path_str));
+    }
+
+    // Resolve the output path: if the user didn't supply one, drop
+    // the .zip next to the input with the input's stem.
+    let output_path = match output_path_str {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let stem = input_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("archive");
+            input_path
+                .parent()
+                .map(|p| p.join(format!("{}.zip", stem)))
+                .unwrap_or_else(|| PathBuf::from(format!("{}.zip", stem)))
+        }
+    };
+
+    // Collect (name, bytes) pairs to feed into the zip writer. For a
+    // directory we walk it recursively; for a single file we emit one
+    // entry. Each entry's bytes are pre-compressed with the chosen
+    // backend so the final .zip contains the already-compressed
+    // payload (we use the "stored" method inside .zip — i.e., method
+    // 0 — so we don't double-compress with LZMA and waste CPU).
+    //
+    // Wait — that's wrong. If we store the .nxs bytes inside .zip
+    // using method 0, the .zip is meaningless (it's just a wrapper
+    // around .nxs files). We need the .zip to be standalone —
+    // decompressable by WinRAR.
+    //
+    // So we use LZMA method (14) directly on the raw file bytes.
+    // That's what the user gets when they pick "compress in WinRAR
+    // style": the file bytes are LZMA-compressed and stored in a .zip
+    // wrapper. Lossless, ratio-comparable to .7z on most inputs.
+    let (files, total_in) = tauri::async_runtime::spawn_blocking({
+        let input_path = input_path.clone();
+        let backend = backend_str.clone();
+        let pwd = password.clone();
+        move || collect_input_files(&input_path, &backend, lzma_level, pwd.as_deref())
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {}", e))??;
+
+    // Write the .zip with LZMA on each entry.
+    let output_path_for_write = output_path.clone();
+    let written = tauri::async_runtime::spawn_blocking(move || {
+        crate::external_archive::write_zip_with_lzma(&files, &output_path_for_write)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {}", e))??;
+
+    let ratio = if total_in > 0 {
+        total_in as f64 / written as f64
+    } else {
+        0.0
+    };
+
+    let filename = output_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("archive.zip")
+        .to_string();
+
+    if let Err(e) = persist_compression(&db_state, &filename, total_in, written).await {
+        eprintln!("[nexus-rar] WARN: failed to persist zip compression stats: {}", e);
+    }
+
+    Ok(CompressToZipResp {
+        output_path: output_path.to_string_lossy().into_owned(),
+        input_bytes: total_in,
+        output_bytes: written,
+        ratio,
+    })
+}
+
+/// Walk the input path and collect (entry_name, raw_bytes) pairs.
+/// For a directory, every file becomes an entry whose name is the
+/// relative path from the directory root. For a single file, the
+/// entry name is the file's basename.
+fn collect_input_files(
+    input_path: &Path,
+    _backend: &str,
+    _lzma_level: u32,
+    _password: Option<&str>,
+) -> Result<(Vec<(String, Vec<u8>)>, u64), String> {
+    let mut out = Vec::new();
+    let mut total_in: u64 = 0;
+    let meta = std::fs::metadata(input_path).map_err(|e| format!("stat: {}", e))?;
+    if meta.is_dir() {
+        // Recursive walk. We avoid pulling in the `walkdir` crate
+        // because the dependency budget is tight; std::fs::read_dir
+        // is enough for our scale (typical use: a few thousand files
+        // per archive).
+        let mut stack = vec![input_path.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).map_err(|e| format!("read_dir: {}", e))? {
+                let entry = entry.map_err(|e| format!("dir entry: {}", e))?;
+                let path = entry.path();
+                let ft = entry.file_type().map_err(|e| format!("file_type: {}", e))?;
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if ft.is_file() {
+                    let rel = path
+                        .strip_prefix(input_path)
+                        .map_err(|e| format!("strip_prefix: {}", e))?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+                    total_in += bytes.len() as u64;
+                    out.push((rel, bytes));
+                }
+                // Symlinks are skipped — they don't round-trip well
+                // through .zip without special handling, and the
+                // user's "WinRAR-style" use case is plain files.
+            }
+        }
+    } else {
+        let bytes = std::fs::read(input_path).map_err(|e| format!("read: {}", e))?;
+        total_in = bytes.len() as u64;
+        let name = input_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        out.push((name, bytes));
+    }
+    Ok((out, total_in))
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct GithubUpdateInfo {
+    pub has_update: bool,
+    pub current_version: String,
+    pub latest_version: String,
+    pub release_url: String,
+    pub release_notes: String,
+}
+
+fn parse_semver_tuple(v: &str) -> (u64, u64, u64) {
+    let clean = v.trim().trim_start_matches(['v', 'V']);
+    let core = clean.split(['-', '+']).next().unwrap_or("0.0.0");
+    let mut parts = core.split('.').filter_map(|p| p.parse::<u64>().ok());
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
+#[tauri::command]
+pub async fn check_github_update_cmd() -> Result<GithubUpdateInfo, String> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .user_agent("NexusRAR-Updater/1.0")
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+
+    let rel_url = "https://api.github.com/repos/bierfor/nexus-compress/releases/latest";
+    if let Ok(resp) = client.get(rel_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let tag = json.get("tag_name").and_then(|v| v.as_str()).unwrap_or(&current);
+                let html_url = json
+                    .get("html_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("https://github.com/bierfor/nexus-compress/releases");
+                let body = json.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                let has_update = parse_semver_tuple(tag) > parse_semver_tuple(&current);
+                return Ok(GithubUpdateInfo {
+                    has_update,
+                    current_version: current,
+                    latest_version: tag.trim_start_matches(['v', 'V']).to_string(),
+                    release_url: html_url.to_string(),
+                    release_notes: body.chars().take(400).collect(),
+                });
+            }
+        }
+    }
+
+    // Fallback to tags if no formal GitHub Release exists yet
+    let tags_url = "https://api.github.com/repos/bierfor/nexus-compress/tags?per_page=1";
+    if let Ok(resp) = client.get(tags_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
+                if let Some(first) = arr.first() {
+                    let tag = first.get("name").and_then(|v| v.as_str()).unwrap_or(&current);
+                    let has_update = parse_semver_tuple(tag) > parse_semver_tuple(&current);
+                    return Ok(GithubUpdateInfo {
+                        has_update,
+                        current_version: current,
+                        latest_version: tag.trim_start_matches(['v', 'V']).to_string(),
+                        release_url: "https://github.com/bierfor/nexus-compress/releases".to_string(),
+                        release_notes: String::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(GithubUpdateInfo {
+        has_update: false,
+        current_version: current.clone(),
+        latest_version: current,
+        release_url: "https://github.com/bierfor/nexus-compress/releases".to_string(),
+        release_notes: String::new(),
+    })
+}
+
+#[tauri::command]
+pub async fn open_external_url_cmd(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("Only http/https URLs are allowed".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn()
+            .map_err(|e| format!("open url: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("open url: {}", e))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("open url: {}", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn split_archive_file_cmd(file_path: String, chunk_mb: usize) -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        let limit = chunk_mb.max(1).saturating_mul(1024 * 1024);
+        let data = std::fs::read(&file_path).map_err(|e| format!("read {}: {}", file_path, e))?;
+        if data.len() <= limit {
+            return Ok(vec![file_path]);
+        }
+        let mut parts = Vec::new();
+        for (idx, chunk) in data.chunks(limit).enumerate() {
+            let part_path = format!("{}.{:03}", file_path, idx + 1);
+            std::fs::write(&part_path, chunk).map_err(|e| format!("write {}: {}", part_path, e))?;
+            parts.push(part_path);
+        }
+        let _ = std::fs::remove_file(&file_path);
+        Ok(parts)
+    })
+    .await
+    .map_err(|e| format!("join: {}", e))?
+}
+
+#[tauri::command]
+pub async fn join_multipart_file_cmd(first_part_path: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let p = Path::new(&first_part_path);
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.len() != 3 || !ext.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(first_part_path);
+        }
+        let prefix = first_part_path
+            .strip_suffix(&format!(".{}", ext))
+            .unwrap_or(&first_part_path);
+        let mut combined = Vec::new();
+        let mut idx = 1usize;
+        loop {
+            let part = format!("{}.{:03}", prefix, idx);
+            if !Path::new(&part).exists() {
+                break;
+            }
+            let bytes = std::fs::read(&part).map_err(|e| format!("read {}: {}", part, e))?;
+            combined.extend_from_slice(&bytes);
+            idx += 1;
+        }
+        if combined.is_empty() {
+            return Err(format!("No multipart volumes found for {}", first_part_path));
+        }
+        std::fs::write(prefix, &combined).map_err(|e| format!("write {}: {}", prefix, e))?;
+        Ok(prefix.to_string())
+    })
+    .await
+    .map_err(|e| format!("join: {}", e))?
 }

@@ -16,6 +16,7 @@ pub mod ast_minify;
 pub mod cdc;
 pub mod classifier;
 pub mod codec;
+pub mod profile;
 /// Sprint 5.7.2 — Block-level AES-256-GCM encryption with
 /// Argon2id KDF. The `derive_key` entry point produces a
 /// `KdfResult` whose `preset_used` field goes straight
@@ -41,6 +42,7 @@ pub mod dict_codec;
 pub mod dictionary;
 pub mod engine;
 pub mod format;
+pub mod format_v2;
 pub mod fs;
 pub mod lz77;
 pub mod minify;

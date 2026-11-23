@@ -16,7 +16,13 @@
         <div class="brand">
           <span class="logo-glyph">▣</span>
           <span class="brand-name">NexusRAR</span>
-          <span class="brand-sub">v0.1.0</span>
+          <span class="brand-sub" id="app-version">v0.1.2</span>
+          <button type="button" class="update-check-btn" id="btn-check-update" title="Check GitHub updates">
+            ↻ check updates
+          </button>
+          <button type="button" class="update-pill" id="update-banner" hidden>
+            ★ update available
+          </button>
         </div>
         <div class="status-pill" id="status-pill" data-state="idle">
           <span class="status-dot"></span>
@@ -93,6 +99,15 @@
               </div>
               <div class="setting-hint" id="setting-hint">
                 lazy LZ77 + 5-stream rANS · fastest, ~3× typical ratio
+              </div>
+              <div class="setting-row" style="margin-top: 14px; margin-bottom: 0;">
+                <label class="setting-label" for="split-select">split parts</label>
+                <select id="split-select" class="split-select">
+                  <option value="0" selected>Single file (off)</option>
+                  <option value="500">500 MB / part</option>
+                  <option value="1000">1000 MB / part</option>
+                  <option value="1900">1900 MB / part</option>
+                </select>
               </div>
             </div>
 

@@ -15,16 +15,21 @@
       {
         "title": "NexusRAR — Hybrid Compressor",
         "label": "main",
-        "width": 1100,
-        "height": 720,
+        "width": 1200,
+        "height": 780,
         "minWidth": 900,
         "minHeight": 600,
         "resizable": true,
+        "maximizable": true,
+        "minimizable": true,
         "fullscreen": false,
         "decorations": false,
         "transparent": false,
         "alwaysOnTop": false,
-        "center": true,
+        "visible": true,
+        "skipTaskbar": false,
+        "x": 100,
+        "y": 100,
         "backgroundColor": "#0a0a0c",
         "titleBarStyle": "Overlay",
         "hiddenTitle": true
@@ -45,6 +50,9 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "Hybrid compressor GUI (LZ77 + rANS + dict codec)",
-    "longDescription": "NexusRAR is the desktop GUI for NexusCompress, a hybrid compressor combining LZ77 lazy matching with a 5-stream rANS entropy coder and a per-block dictionary codec. Sprint 4.0 ships a Next.js + Tailwind dark-cyberpunk UI on top of the Tauri 2.x runtime."
+    "longDescription": "NexusRAR is the desktop GUI for NexusCompress, a hybrid compressor combining LZ77 lazy matching with a 5-stream rANS entropy coder and a per-block dictionary codec. Sprint 4.0 ships a Next.js + Tailwind dark-cyberpunk UI on top of the Tauri 2.x runtime.",
+    "android": {
+      "minSdkVersion": 24
+    }
   }
 }

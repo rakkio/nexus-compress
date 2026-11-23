@@ -30,7 +30,19 @@ use std::path::Path;
 /// "go up one directory"). This helper walks `Path::components`
 /// and rejects only `.` / `..` / absolute roots / null bytes /
 /// control characters.
-fn safe_relative_path(entry_path: &str) -> Result<(), String> {
+///
+/// Public so other archive readers (zip / 7z / rar in
+/// `external_archive.rs`) can reuse it without re-implementing the
+/// traversal check.
+///
+/// **Sprint 5.7.x**: on Windows, `Path::is_absolute()` returns false
+/// for Unix-style paths like `/etc/passwd`, so the bare check would
+/// let them through. We also explicitly reject any path that starts
+/// with `/` or `\` (the two "absolute path" roots across Win +
+/// Unix). This is what the WinRAR-style .zip / .7z / .rar readers
+/// need — malicious archives that try to escape the output dir by
+/// injecting Unix-style absolute paths.
+pub fn safe_relative_path(entry_path: &str) -> Result<(), String> {
     if entry_path.is_empty() {
         return Err("empty entry path".to_string());
     }
@@ -56,6 +68,18 @@ fn safe_relative_path(entry_path: &str) -> Result<(), String> {
     // caught above, "\\server\share" on Windows).
     if p.is_absolute() {
         return Err(format!("absolute entry path: {:?}", entry_path));
+    }
+    // Cross-platform absolute-path detection: `Path::is_absolute()`
+    // on Windows only returns true for paths with a drive prefix
+    // (e.g. `C:\foo`) or UNC paths (`\\server\share`). It returns
+    // false for `/etc/passwd` even though that path is dangerous.
+    // Reject any leading `/` or `\` explicitly so Unix-style
+    // absolute paths can't sneak through on Windows.
+    if entry_path.starts_with('/') || entry_path.starts_with('\\') {
+        return Err(format!(
+            "entry path starts with absolute root separator: {:?}",
+            entry_path
+        ));
     }
     for component in p.components() {
         use std::path::Component;

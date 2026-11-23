@@ -274,4 +274,4 @@ issues, sends PRs, or spreads the word.
 
 ---
 
-**Made with Rust + Next.js + a lot of ☕ in Rome.**
+**Made with Rust + Next.js + a lot of ☕ in Milan**

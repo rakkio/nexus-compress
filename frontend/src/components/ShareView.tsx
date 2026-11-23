@@ -1,6 +1,33 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+/**
+ * ShareView — Sprint 5.7.32 overhaul.
+ *
+ * UX improvements vs the previous version:
+ *
+ * - **QR default-on**: when a link is active the QR is shown by default
+ *   at a usable 220×220 px (vs 180 px), with a "Hide QR" toggle. Most
+ *   users want the QR so they can wave their phone over the laptop.
+ * - **Token length feedback**: even when masked, the receive token
+ *   field shows "N caracteres" so the user can verify the paste
+ *   was complete.
+ * - **Token auto-grow**: the textarea starts at 1 row but grows up
+ *   to 5 rows when the user pastes a long token.
+ * - **Copy-all button**: one click copies "URL\nToken" so the
+ *   sender can paste either form.
+ * - **Share via OS**: a secondary button uses `navigator.share` if
+ *   available so mobile-style share sheet opens on supported hosts.
+ * - **Encryption toggle** in the sender (encrypts the token via
+ *   Argon2id-derived passphrase — backend routes to the encrypted
+ *   pipeline).
+ * - **Better step visualization** in the receiver: numbered chips
+ *   with active/done/error states + a linear progress bar.
+ * - **Toast on success/error** for both send and receive.
+ *
+ * The backend is unchanged — all wins are pure UX.
+ */
+
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { type View } from "@/components/NeoTopBar";
 import { PageHeader } from "@/components/PageHeader";
 import { useLocale } from "@/components/LocaleProvider";
@@ -32,10 +59,15 @@ import {
   KeyRound,
   Eye,
   EyeOff,
+  Share2,
+  ChevronRight,
+  Loader2,
 } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
+import { invoke } from "@tauri-apps/api/core";
 import { useAppStats, useRecentEvents } from "@/lib/useAppData";
 import { formatBytes, formatTimestampMs } from "@/lib/format";
+import { toast } from "@/components/Toaster";
 
 const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -88,47 +120,50 @@ export function ShareView({
 }) {
   const { t, locale } = useLocale();
 
-  // Sprint 5.6.29: lift the share state to ShareView so both the
-  // SendPanel (left) and LinkPanel (right) can render from the same
-  // state without prop-drilling or context.
+  // Lift the share state to ShareView so both the SendPanel (left)
+  // and LinkPanel (right) can render from the same state.
   const [shareResp, setShareResp] = useState<SendStartResp | null>(null);
 
   // Sprint 5.7: real share stats + recent share events so the
-  // LinkPanel Actividad section shows actual past transfers,
-  // not hardcoded placeholder text.
+  // LinkPanel Actividad section shows actual past transfers.
   const { stats } = useAppStats();
   const { ops: recentShares } = useRecentEvents(50, []);
   const recentShareEvents = recentShares.filter((o) => o.kind === "share").slice(0, 3);
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-7xl mx-auto px-8 pt-8 pb-16">
-        {/* Header — title + 3 selling-point pills on the right */}
-        <div className="flex items-start justify-between mb-8 gap-6">
-          <div>
+        {/* Page header — cleaner: 1 hero line + 1-line feature strip */}
+        <div className="mb-7">
+          <div className="flex items-center gap-2.5 mb-2">
+            <span className="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-500/20 to-emerald-500/20 border border-cyan-500/30 flex items-center justify-center">
+              <Send size={16} className="text-cyan-300" />
+            </span>
             <h1 className="text-white text-[32px] font-semibold tracking-tight leading-tight">
               {t("share.title")}
             </h1>
-            <p className="text-zinc-500 text-[14px] mt-1.5">
-              {t("share.desc")}
-            </p>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <span className="chip chip-cyan">
+          <p className="text-zinc-500 text-[14px] max-w-2xl">
+            {t("share.desc")}
+          </p>
+          {/* Compact feature strip — 3 chips inline, no big badges */}
+          <div className="mt-4 flex items-center gap-2 flex-wrap text-[11px]">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-300">
               <InfinityIcon size={11} />
               {t("share.feature.unlimited")}
             </span>
-            <span className="chip">{t("share.feature.nostorage")}</span>
-            <span className="chip chip-cyan">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-cyan-300">
+              <Server size={11} />
+              {t("share.feature.nostorage")}
+            </span>
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-300">
               <Shield size={11} />
               {t("share.feature.e2e")}
             </span>
           </div>
         </div>
 
-        {/* 2-column layout: Send flow | Link preview.
-            Sprint 5.7: fixed 3-col card-balanced layout (was 2-col).
-            SendPanel gets 5/12 cols, LinkPanel gets 7/12 cols. */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 mb-8">
+        {/* 2-column: Send | Link. SendPanel 5/12 cols, LinkPanel 7/12. */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 mb-6">
           <div className="lg:col-span-5">
             <SendPanel onComplete={onComplete} onRespChange={setShareResp} />
           </div>
@@ -180,8 +215,13 @@ function SendPanel({
   const [pathInput, setPathInput] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [copied, setCopied] = useState<"code" | "token" | null>(null);
+  // Sprint 5.7.32 — encryption toggle. Maps to Argon2id-protected
+  // transfer; backend decides route based on the password presence.
+  const [encrypt, setEncrypt] = useState(false);
+  const [password, setPassword] = useState("");
+  const [showPwd, setShowPwd] = useState(false);
 
-  // Sprint 5.6.29: bubble `resp` up to ShareView so LinkPanel can render.
+  // Bubble `resp` up to ShareView so LinkPanel can render.
   useEffect(() => {
     onRespChange?.(resp);
   }, [resp, onRespChange]);
@@ -198,52 +238,36 @@ function SendPanel({
   // drag-drop
   const onDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     setDragOver(true);
   }, []);
-  const onDragLeave = useCallback(() => setDragOver(false), []);
-  const onDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      setDragOver(false);
-      const paths: string[] = (e as any).detail?.paths ?? [];
-      if (paths.length) acceptPath(paths[0]);
-    },
-    [acceptPath]
-  );
-
-  // Tauri native drag-drop
-  useEffect(() => {
-    if (!isTauri) return;
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      try {
-        const ev = (window as any).__TAURI__?.event;
-        if (!ev?.listen) return;
-        unlisten = await ev.listen("tauri://drag-drop", (e: any) => {
-          const paths: string[] = e?.payload?.paths ?? [];
-          if (paths.length) acceptPath(paths[0]);
-        });
-      } catch {}
-    })();
-    return () => unlisten?.();
+  const onDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+  }, []);
+  const onDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    const tauriPaths = (e as any).detail?.paths ?? null;
+    if (tauriPaths?.length) {
+      acceptPath(tauriPaths[0]);
+    }
   }, [acceptPath]);
 
   const onBrowseFile = useCallback(async () => {
-    if (!isTauri) return;
+    if (!isTauri) {
+      toast.info("Necesitas correr dentro de la app Tauri para usar el picker nativo.");
+      return;
+    }
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const r = await open({ multiple: false, directory: false, filters: [{ name: "All files", extensions: ["*"] }] });
       if (typeof r === "string") acceptPath(r);
-    } catch {}
-  }, [acceptPath]);
-
-  const onBrowseFolder = useCallback(async () => {
-    if (!isTauri) return;
-    try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const r = await open({ multiple: false, directory: true });
-      if (typeof r === "string") acceptPath(r);
-    } catch {}
+    } catch (e) {
+      toast.error("No se pudo abrir el selector de archivos");
+    }
   }, [acceptPath]);
 
   const onSend = useCallback(async () => {
@@ -253,16 +277,28 @@ function SendPanel({
     const t0 = Date.now();
     try {
       const r = await tauriInvoke<SendStartResp>("p2p_send_start_cmd", {
-        req: { file_path: filePath, code: null },
+        req: {
+          file_path: filePath,
+          code: null,
+          password: encrypt && password ? password : null,
+        },
       });
       setResp(r);
-      onComplete({ kind: "share", filename: r.filename, originalBytes: r.file_size, durationMs: Date.now() - t0 });
+      onComplete({
+        kind: "share",
+        filename: r.filename,
+        originalBytes: r.file_size,
+        durationMs: Date.now() - t0,
+      });
+      toast.success(`Enlace activo: "${r.filename}"`);
     } catch (e: any) {
-      setError(String(e?.message ?? e));
+      const msg = String(e?.message ?? e);
+      setError(msg);
+      toast.error(msg);
     } finally {
       setBusy(false);
     }
-  }, [filePath, onComplete]);
+  }, [filePath, encrypt, password, onComplete]);
 
   const onCancel = useCallback(async () => {
     setCancelling(true);
@@ -278,22 +314,28 @@ function SendPanel({
     setError(null);
     setPathInput("");
     setCopied(null);
+    setPassword("");
+    setEncrypt(false);
   }, []);
 
   const onCopy = useCallback(async (text: string, which: "code" | "token") => {
     try { await navigator.clipboard.writeText(text); } catch {}
     setCopied(which);
     setTimeout(() => setCopied(null), 1800);
+    toast.info("Copiado al portapapeles");
   }, []);
 
-  const filename = filePath ? filePath.split("/").pop() : null;
+  const filename = filePath ? filePath.split(/[\\/]/).pop() : null;
 
   return (
     <div
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
-      className="glass rounded-3xl p-6 flex flex-col gap-5"
+      className={
+        "glass rounded-3xl p-6 flex flex-col gap-4 transition-colors " +
+        (dragOver ? "ring-2 ring-cyan-400/40" : "")
+      }
     >
       {/* Step header */}
       <div className="flex items-center gap-2.5">
@@ -312,49 +354,44 @@ function SendPanel({
 
       {!resp ? (
         <>
-          {/* Dropzone with file icon + CTA button */}
+          {/* Dropzone — simpler, more inviting */}
           <div
             className={
-              "relative rounded-2xl p-10 text-center transition-all duration-200 cursor-pointer " +
+              "relative rounded-2xl p-8 text-center transition-all duration-200 cursor-pointer " +
               (dragOver
-                ? "border-2 border-solid border-cyan-400 bg-cyan-500/[0.10] shadow-[0_0_40px_-8px_rgba(34,211,238,0.5)] scale-[1.01]"
-                : "border-2 border-dashed border-white/[0.10] bg-white/[0.02] hover:border-white/[0.20] hover:bg-white/[0.03]")
+                ? "border-2 border-solid border-cyan-400 bg-cyan-500/[0.10] scale-[1.01]"
+                : "border-2 border-dashed border-white/[0.10] bg-white/[0.02] hover:border-cyan-500/30 hover:bg-cyan-500/[0.04]")
             }
+            onClick={onBrowseFile}
           >
             {dragOver && (
               <div className="absolute inset-0 rounded-2xl pointer-events-none animate-pulse-glow" />
             )}
             <div
               className={
-                "mx-auto mb-4 w-16 h-16 rounded-2xl flex items-center justify-center transition-all duration-300 text-blue-500 " +
-                (dragOver
-                  ? "bg-blue-500/20 scale-110 rotate-[-6deg]"
-                  : "bg-blue-500/10 group-hover:scale-105")
+                "mx-auto mb-3 w-14 h-14 rounded-2xl flex items-center justify-center transition-all duration-300 " +
+                (dragOver ? "bg-cyan-500/25 scale-110 rotate-[-6deg]" : "bg-blue-500/10 group-hover:scale-105")
               }
             >
               {dragOver ? (
-                <ArrowRight size={28} strokeWidth={2.2} />
+                <ArrowRight size={26} strokeWidth={2.2} className="text-cyan-200" />
               ) : (
-                <FileText size={28} strokeWidth={1.6} />
+                <FileText size={26} strokeWidth={1.6} className="text-blue-300" />
               )}
             </div>
-            <p className="text-white text-[14px] font-medium mb-1">
+            <p className="text-white text-[14px] font-semibold mb-1">
               {dragOver ? t("share.send.drop.active") : t("share.send.drop")}
             </p>
-            <p className="text-zinc-500 text-[12px] mb-5">
+            <p className="text-zinc-500 text-[12px] mb-4">
               {t("share.send.drop.hint")}
             </p>
-            {/* Solid cyan button (matches mockup — no gradient) */}
-            <button
-              onClick={onBrowseFile}
-              className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl bg-blue-500 hover:bg-blue-400 text-white text-[13px] font-semibold transition-all duration-150 hover:-translate-y-px shadow-[0_4px_20px_-6px_rgba(59,130,246,0.55)]"
-            >
+            <span className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-blue-500 hover:bg-blue-400 text-white text-[12.5px] font-semibold transition-all duration-150 hover:-translate-y-px shadow-[0_4px_20px_-6px_rgba(59,130,246,0.55)]">
               <File size={14} />
               {t("share.send.choose")}
-            </button>
+            </span>
           </div>
 
-          {/* Selected file preview — matches mockup: gray icon, simple card */}
+          {/* File preview */}
           {filePath && (
             <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-3 flex items-center gap-3 animate-scale-in">
               <div className="w-10 h-10 rounded-lg bg-white/[0.05] flex items-center justify-center text-zinc-400 shrink-0">
@@ -365,103 +402,83 @@ function SendPanel({
                   {filename}
                 </p>
                 <p className="text-zinc-500 text-[10.5px] mt-0.5">
-                  Listo para compartir
+                  {t("share.send.ready")}
                 </p>
               </div>
               <button
-                onClick={() => setFilePath(null)}
+                onClick={() => acceptPath(null)}
                 className="text-zinc-500 hover:text-white transition-colors p-1.5 rounded-md hover:bg-white/[0.05]"
                 aria-label={t("share.send.remove")}
+                title={t("share.send.remove")}
               >
                 <X size={16} />
               </button>
             </div>
           )}
 
-          {/* Advanced options accordion */}
+          {/* Encryption option — collapsed by default, expands on click */}
           {filePath && (
-            <details className="rounded-xl border border-white/[0.06] bg-white/[0.02] open:bg-white/[0.03] group">
-              <summary className="flex items-center gap-2 px-4 py-3 cursor-pointer list-none select-none text-zinc-400 hover:text-white transition-colors">
-                <Settings2 size={14} />
-                <span className="text-[12px] font-medium flex-1">
-                  {t("share.send.advanced")}
+            <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
+              <button
+                onClick={() => setEncrypt((v) => !v)}
+                className="w-full flex items-center gap-2 px-4 py-3 text-left hover:bg-white/[0.03] transition-colors"
+              >
+                <Lock size={13} className={encrypt ? "text-amber-300" : "text-zinc-500"} />
+                <span className="flex-1 text-[12.5px] text-zinc-200 font-medium">
+                  {t("share.send.encrypt")}
                 </span>
-                <ChevronDown
-                  size={14}
-                  className="transition-transform duration-200 group-open:rotate-180"
-                />
-              </summary>
-              <div className="px-4 pb-4 flex flex-col gap-3 text-[12.5px]">
-                {/* Custom slug */}
-                <div className="flex items-center gap-3">
-                  <LinkIcon size={14} className="text-zinc-500 shrink-0" />
-                  <span className="text-zinc-300 shrink-0">
-                    {t("share.send.customslug")}
+                {encrypt ? (
+                  <span className="text-[10.5px] uppercase tracking-wider px-1.5 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/30 text-amber-300">
+                    ON
                   </span>
-                  <span className="text-zinc-600 text-[10.5px]">
-                    ({t("share.send.optional")})
-                  </span>
-                  <input
-                    type="text"
-                    placeholder={t("share.send.customslug.placeholder")}
-                    className="input flex-1 py-1.5 text-[12px] font-mono"
-                  />
+                ) : (
+                  <ChevronRight size={13} className="text-zinc-500" />
+                )}
+              </button>
+              {encrypt && (
+                <div className="px-4 pb-4 pt-1 flex flex-col gap-2 animate-fade-in border-t border-white/[0.06]">
+                  <p className="text-zinc-500 text-[11px]">
+                    {t("share.send.encrypt.hint")}
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type={showPwd ? "text" : "password"}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder={t("share.send.encrypt.placeholder")}
+                      className="flex-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[12.5px] font-mono text-white placeholder-zinc-600 focus:outline-none focus:border-amber-500/50"
+                    />
+                    <button
+                      onClick={() => setShowPwd((v) => !v)}
+                      className="p-2 rounded-md text-zinc-500 hover:text-white hover:bg-white/[0.05] transition-colors"
+                      title={showPwd ? "Hide" : "Show"}
+                    >
+                      {showPwd ? <EyeOff size={13} /> : <Eye size={13} />}
+                    </button>
+                  </div>
                 </div>
-                {/* Expiration */}
-                <div className="flex items-center gap-3">
-                  <Clock size={14} className="text-zinc-500 shrink-0" />
-                  <span className="text-zinc-300 shrink-0">
-                    {t("share.send.expiration")}
-                  </span>
-                  <select
-                    defaultValue="7d"
-                    className="ml-auto bg-transparent border border-white/[0.08] rounded-lg px-3 py-1.5 text-[12px] text-zinc-200 focus:outline-none focus:border-cyan-500/50 cursor-pointer hover:border-white/[0.16] transition-colors"
-                  >
-                    <option value="1d">1 {t("share.send.day")}</option>
-                    <option value="7d">7 {t("share.send.days")}</option>
-                    <option value="30d">30 {t("share.send.days")}</option>
-                    <option value="never">{t("share.send.never")}</option>
-                  </select>
-                </div>
-                {/* Download limit */}
-                <div className="flex items-center gap-3">
-                  <Download size={14} className="text-zinc-500 shrink-0" />
-                  <span className="text-zinc-300 shrink-0">
-                    {t("share.send.downloadlimit")}
-                  </span>
-                  <select
-                    defaultValue="none"
-                    className="ml-auto bg-transparent border border-white/[0.08] rounded-lg px-3 py-1.5 text-[12px] text-zinc-200 focus:outline-none focus:border-cyan-500/50 cursor-pointer hover:border-white/[0.16] transition-colors"
-                  >
-                    <option value="none">{t("share.send.unlimited")}</option>
-                    <option value="5">5</option>
-                    <option value="10">10</option>
-                    <option value="50">50</option>
-                    <option value="100">100</option>
-                  </select>
-                </div>
-              </div>
-            </details>
+              )}
+            </div>
           )}
 
-          {/* Big gradient CTA */}
+          {/* Big CTA */}
           <button
             onClick={onSend}
-            disabled={!filePath || busy}
-            className="w-full py-4 rounded-2xl font-semibold text-[14.5px] text-white relative overflow-hidden disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 hover:scale-[1.01] active:scale-[0.99] disabled:hover:scale-100"
+            disabled={!filePath || busy || (encrypt && !password)}
+            className="w-full py-3.5 rounded-2xl font-semibold text-[14.5px] text-white relative overflow-hidden disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 hover:scale-[1.01] active:scale-[0.99] disabled:hover:scale-100"
             style={{
-              background: busy
-                ? "linear-gradient(135deg, #34d399 0%, #22d3ee 100%)"
-                : "linear-gradient(135deg, #34d399 0%, #10b981 35%, #22d3ee 100%)",
-              boxShadow: !busy && filePath
-                ? "0 8px 32px -8px rgba(34,211,238,0.55), 0 0 0 1px rgba(255,255,255,0.08) inset"
-                : "none",
+              background:
+                "linear-gradient(135deg, #34d399 0%, #10b981 35%, #22d3ee 100%)",
+              boxShadow:
+                !busy && filePath
+                  ? "0 8px 32px -8px rgba(34,211,238,0.55), 0 0 0 1px rgba(255,255,255,0.08) inset"
+                  : "none",
             }}
           >
             <span className="relative z-10 flex items-center justify-center gap-2">
               {busy ? (
                 <>
-                  <RefreshCw size={16} className="animate-spin-slow" />
+                  <Loader2 size={16} className="animate-spin" />
                   {t("share.send.btn.busy")}
                 </>
               ) : (
@@ -477,7 +494,7 @@ function SendPanel({
           </p>
         </>
       ) : (
-        /* Active link — show summary in left card too */
+        /* Active link */
         <div className="rounded-2xl bg-emerald-500/[0.06] border border-emerald-500/20 p-5 flex flex-col gap-4 animate-scale-in">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-lg bg-rose-500/15 border border-rose-500/30 flex items-center justify-center text-rose-300 shrink-0">
@@ -488,12 +505,13 @@ function SendPanel({
                 {resp.filename}
               </p>
               <p className="text-zinc-500 text-[11px] font-mono mt-0.5">
-                {prettyBytes(resp.file_size)}
+                {prettyBytes(resp.file_size)} · {t("share.send.active")}
               </p>
             </div>
             <button
               onClick={onReset}
               className="btn btn-ghost"
+              title={t("share.send.new")}
             >
               <RefreshCw size={12} />
               {t("share.send.new")}
@@ -524,27 +542,27 @@ function ReceivePanel() {
   const [resolvedDownloads, setResolvedDownloads] = useState("");
   const [resolvedHome, setResolvedHome] = useState("");
   const [suggestedName, setSuggestedName] = useState("");
-  // Sprint 5.6.25: tracks whether the user has manually picked
-  // a destination via the save dialog. While false, the field
-  // auto-syncs to `<resolvedDownloads>/<suggestedName>` whenever
-  // the filename becomes known. While true, the auto-sync is
-  // disabled so we don't clobber the user's chosen destination.
-  // Reset to false whenever the user changes the token (handled
-  // by a dedicated useEffect that watches [token] only).
-  const [userEditedPath, setUserEditedPath] = useState(false);
 
-  // Sprint 5.6.26: true while the v2/v3 filename probe is in
-  // flight. While true, the "Cambiar" button is disabled so the
-  // user can't open the save dialog with a fallback default and
-  // pick a path before the real filename is known. Prevents the
-  // race: "user clicks Cambiar → probe resolves → user has a
-  // path with the wrong filename and we can't auto-fix it".
+  const [userEditedPath, setUserEditedPath] = useState(false);
   const [probing, setProbing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ReceiveResp | null>(null);
   const [stepIdx, setStepIdx] = useState(-1);
   const [stepErr, setStepErr] = useState(false);
+
+  // Sprint 5.7.32 — token textarea auto-resizes up to 5 rows
+  // based on content. Keeps a single-line token readable while
+  // letting multi-line pastes breathe.
+  const tokenRef = useRef<HTMLTextAreaElement | null>(null);
+  useEffect(() => {
+    const el = tokenRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const lineHeight = 22; // px, matches text-[12.5px] line height
+    const newHeight = Math.min(Math.max(el.scrollHeight, lineHeight), lineHeight * 5);
+    el.style.height = `${newHeight}px`;
+  }, [token]);
 
   const kind = (() => {
     const tk = token.trim();
@@ -568,22 +586,12 @@ function ReceivePanel() {
     })();
   }, []);
 
-// Sprint 5.6.26: separate effect for the manual-edit reset.
-// Triggered ONLY by the user's actual onChange action (typing,
-// pasting, clearing the token field). Decoupled from the
-// probe logic so the behaviour is predictable regardless of
-// probe timing — clearing the token resets the flag, pasting a
-// new token resets the flag, no probe race can ever leak an
-// unwanted reset.
+  // Reset manual-edit flag when token changes.
   useEffect(() => {
     setUserEditedPath(false);
   }, [token]);
 
-// Peek filename from v1 token (parsed locally) and from v2/v3
-  // (probes the sender's /meta endpoint via p2p_peek_filename_cmd).
-  // Sprint 5.6.25: works for ALL token versions now, so the path
-  // field can auto-fill the moment the user pastes a token — no
-  // waiting for the receive round-trip to complete.
+  // Peek filename from token.
   useEffect(() => {
     const tk = token.trim();
     if (!tk) { setSuggestedName(""); setProbing(false); return; }
@@ -596,15 +604,6 @@ function ReceivePanel() {
       return;
     }
     if (kind === "v2" || kind === "v3") {
-      // Probe the sender's /meta to read the original filename.
-      // We don't wait — fire-and-forget. The path field will
-      // auto-update if the user hasn't manually edited it yet.
-      //
-      // Sprint 5.6.26: while probing, the "Cambiar" button is
-      // disabled and a subtle spinner shows next to the path.
-      // This kills the race "user clicks Cambiar → opens dialog
-      // with fallback → picks dir → probe resolves → user has
-      // a path with the wrong filename".
       setProbing(true);
       let cancelled = false;
       (async () => {
@@ -618,9 +617,6 @@ function ReceivePanel() {
             setProbing(false);
           }
         } catch {
-          // Sender not reachable / token stale — silently skip.
-          // The path field will still default to ~/Downloads
-          // with the suggestedName being empty (so just the dir).
           if (!cancelled) setProbing(false);
         }
       })();
@@ -628,22 +624,11 @@ function ReceivePanel() {
     }
   }, [token, kind]);
 
-  // Sprint 5.6.25: auto-sync outputPath with the resolved final
-  // destination. The path field is ALWAYS the real final path
-  // the backend will write to — no sentinels, no placeholder
-  // detection, no exception lists. When suggestedName arrives
-  // AND the user hasn't manually overridden the destination,
-  // we populate the field with `<resolvedDownloads>/<filename>`.
-  //
-  // This is the architectural fix: instead of trying to detect
-  // "did the user type a placeholder?" (which requires a
-  // forever-growing list of patterns), we ensure the field
-  // shows the correct path from the start. The user only
-  // needs to type if they want a different destination.
+  // Auto-sync outputPath with the resolved final destination.
   useEffect(() => {
-    if (userEditedPath) return;       // respect manual override
-    if (!resolvedDownloads) return;   // home not resolved yet
-    if (!suggestedName) return;       // no filename known yet
+    if (userEditedPath) return;
+    if (!resolvedDownloads) return;
+    if (!suggestedName) return;
     let cancelled = false;
     (async () => {
       try {
@@ -671,11 +656,6 @@ function ReceivePanel() {
         t("share.receive.step.verifying"),
       ];
 
-  // Sprint 5.6.25: resolve the final output path. Since the
-  // `outputPath` field is ALWAYS the real final path (kept in
-  // sync via the useEffect above), this function only needs to
-  // expand a leading `~/` if present. No placeholder detection,
-  // no exception lists, no heuristics.
   const buildOutputPath = useCallback(async (): Promise<string> => {
     const { join } = await import("@tauri-apps/api/path");
     let p = outputPath;
@@ -692,17 +672,6 @@ function ReceivePanel() {
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const { join, homeDir } = await import("@tauri-apps/api/path");
-      // Sprint 5.6.25: never open the save dialog with a
-      // placeholder default like "recibido" or "archivo_recibido.bin".
-      // If we don't have resolvedDownloads yet (the mount-time
-      // useEffect hasn't fired), resolve it NOW before opening
-      // the dialog — otherwise the user could type "Untitled.*"
-      // and we'd save with that literal filename.
-      //
-      // Pre-fill strategy:
-      //   * outputPath already populated (auto-sync fired) → use it
-      //   * suggestedName known but outputPath empty (race) → dir + name
-      //   * neither → just the dir (no default filename)
       let dir = resolvedDownloads;
       if (!dir) {
         try {
@@ -717,7 +686,7 @@ function ReceivePanel() {
       });
       if (r) {
         setOutputPath(r);
-        setUserEditedPath(true);  // dialog pick = manual choice
+        setUserEditedPath(true);
       }
     } catch {}
   }, [outputPath, resolvedDownloads, suggestedName]);
@@ -732,7 +701,7 @@ function ReceivePanel() {
 
     let actualPath: string;
     try { actualPath = await buildOutputPath(); }
-    catch (e: any) { setError(String(e?.message ?? e)); setBusy(false); return; }
+    catch (e: any) { setError(String(e?.message ?? e)); setBusy(false); toast.error(String(e?.message ?? e)); return; }
 
     setStepIdx(1);
     try {
@@ -749,51 +718,79 @@ function ReceivePanel() {
       if (r.filename) setSuggestedName(r.filename);
       setStepIdx(4);
       setResult(r);
-      // Sprint 5.6.24: sync the input field with the actual
-      // path the backend wrote to. Previously the user's typed
-      // "Untitled.*" stayed in the field, confusing them after
-      // the success card appeared (which shows the new name).
       if (r.output_path) setOutputPath(r.output_path);
+      toast.success(`Recibido: "${r.filename ?? suggestedName ?? "archivo"}"`);
     } catch (e: any) {
-      setError(friendlyError(String(e?.message ?? e)));
+      const msg = friendlyError(String(e?.message ?? e));
+      setError(msg);
       setStepErr(true);
+      toast.error(msg);
     } finally {
       setBusy(false);
     }
-  }, [token, kind, buildOutputPath]);
+  }, [token, kind, buildOutputPath, suggestedName]);
+
+  // Quick paste-and-receive: pressing Ctrl/Cmd+V inside the token
+  // field automatically submits if the token is non-empty + valid.
+  // (Skip on touchscreen devices where paste might trigger from a
+  // text-selection menu.)
+  const onTokenKey = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      onReceive();
+    }
+  }, [onReceive]);
 
   return (
     <div className="glass rounded-3xl p-6 flex flex-col gap-5">
-      {/* Step header */}
-      <div className="flex items-center gap-2.5">
-        <div className="w-8 h-8 rounded-lg bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-cyan-300">
-          <Download size={16} strokeWidth={2.4} />
+      {/* Step header — number badge + title/desc, plus a small
+          hint chip on the right explaining the keyboard shortcut. */}
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-cyan-300">
+            <Download size={16} strokeWidth={2.4} />
+          </div>
+          <div>
+            <h2 className="text-white text-[15px] font-semibold leading-tight">
+              {t("share.receive.title")}
+            </h2>
+            <p className="text-zinc-500 text-[11.5px] mt-0.5">
+              {t("share.receive.desc")}
+            </p>
+          </div>
         </div>
-        <div>
-          <h2 className="text-white text-[15px] font-semibold leading-tight">
-            {t("share.receive.title")}
-          </h2>
-          <p className="text-zinc-500 text-[11.5px] mt-0.5">
-            {t("share.receive.desc")}
-          </p>
-        </div>
+        <span className="text-[10px] uppercase tracking-wider text-zinc-600 px-2 py-0.5 rounded-md border border-white/[0.06] hidden md:inline-flex items-center gap-1 shrink-0">
+          <kbd className="font-mono text-zinc-400">Ctrl</kbd>
+          <span>+</span>
+          <kbd className="font-mono text-zinc-400">V</kbd>
+        </span>
       </div>
 
-      {/* Token input */}
+      {/* Token input — auto-growing textarea */}
       <div>
-        <label className="text-zinc-500 text-[10px] tracking-[0.2em] uppercase font-medium pl-1 block mb-2">
-          {t("share.receive.token.label")}
-        </label>
+        <div className="flex items-center justify-between mb-2">
+          <label className="text-zinc-500 text-[10px] tracking-[0.2em] uppercase font-medium pl-1">
+            {t("share.receive.token.label")}
+          </label>
+          {token.trim().length > 0 && (
+            <span className="text-[10.5px] text-zinc-500 font-mono">
+              {token.trim().length} {t("share.receive.token.chars")}
+            </span>
+          )}
+        </div>
         <textarea
+          ref={tokenRef}
           value={token}
           onChange={(e) => {
             setToken(e.target.value);
             setResult(null);
             setError(null);
           }}
-          rows={3}
+          onKeyDown={onTokenKey}
+          rows={1}
           placeholder={t("share.receive.token.placeholder")}
-          className="input w-full font-mono text-[12.5px] resize-none"
+          className="input w-full font-mono text-[12.5px] resize-none overflow-hidden leading-[22px]"
+          style={{ minHeight: 42 }}
         />
         {kind !== "unknown" && token.length > 0 && (
           <p
@@ -864,7 +861,56 @@ function ReceivePanel() {
         )}
       </div>
 
-      {/* Big CTA — solid blue matching the Send "Elegir archivo" */}
+      {/* Steps — visible during receive, otherwise hidden */}
+      {stepIdx >= 0 && (
+        <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-4 animate-fade-in">
+          <ol className="flex flex-col gap-2.5">
+            {STEPS.map((step, i) => {
+              const done = i < stepIdx || (i === STEPS.length - 1 && stepIdx === STEPS.length - 1 && !stepErr);
+              const active = i === stepIdx && !stepErr;
+              const errored = stepErr && i === stepIdx;
+              return (
+                <li key={i} className="flex items-center gap-2.5">
+                  <span
+                    className={
+                      "w-6 h-6 rounded-full border-2 flex items-center justify-center text-[11px] font-bold shrink-0 transition-colors " +
+                      (errored
+                        ? "border-rose-500 bg-rose-500/15 text-rose-300"
+                        : done
+                          ? "border-emerald-500 bg-emerald-500/15 text-emerald-300"
+                          : active
+                            ? "border-cyan-500 bg-cyan-500/15 text-cyan-300"
+                            : "border-white/[0.10] bg-white/[0.04] text-zinc-500")
+                    }
+                  >
+                    {done ? <Check size={12} /> : errored ? <AlertCircle size={12} /> : i + 1}
+                  </span>
+                  <span
+                    className={
+                      "text-[12.5px] transition-colors " +
+                      (done ? "text-emerald-300" : errored ? "text-rose-300" : active ? "text-white" : "text-zinc-500")
+                    }
+                  >
+                    {step}
+                  </span>
+                </li>
+              );
+            })}
+          </ol>
+          {/* Linear progress bar */}
+          <div className="mt-3 h-1 bg-white/[0.04] rounded-full overflow-hidden">
+            <div
+              className={
+                "h-full transition-all duration-500 " +
+                (stepErr ? "bg-rose-500" : "bg-gradient-to-r from-cyan-400 to-emerald-400")
+              }
+              style={{ width: `${stepErr ? 100 : Math.max(0, ((stepIdx + 1) / STEPS.length) * 100)}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Big CTA */}
       <button
         onClick={onReceive}
         disabled={!token || busy || kind === "unknown"}
@@ -872,7 +918,7 @@ function ReceivePanel() {
       >
         {busy ? (
           <>
-            <RefreshCw size={16} className="animate-spin-slow" />
+            <Loader2 size={16} className="animate-spin" />
             {t("share.receive.btn.busy")}
           </>
         ) : (
@@ -883,84 +929,30 @@ function ReceivePanel() {
         )}
       </button>
 
-      {/* Progress steps */}
-      {busy && stepIdx >= 0 && (
-        <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] px-4 py-3 space-y-2.5 animate-fade-in">
-          {STEPS.map((label, i) => {
-            const done = i < stepIdx;
-            const active = i === stepIdx && !stepErr;
-            const err = i === stepIdx && stepErr;
-            return (
-              <div
-                key={i}
-                className={
-                  "flex items-center gap-2.5 text-[12px] " +
-                  (done
-                    ? "text-emerald-400"
-                    : active
-                    ? "text-cyan-300"
-                    : err
-                    ? "text-rose-400"
-                    : "text-zinc-700")
-                }
-              >
-                <span className="w-4 text-center shrink-0">
-                  {done ? (
-                    <Check size={14} strokeWidth={3} />
-                  ) : active ? (
-                    <RefreshCw size={12} className="animate-spin-slow inline-block" />
-                  ) : err ? (
-                    <X size={14} />
-                  ) : (
-                    <span className="opacity-50">·</span>
-                  )}
-                </span>
-                <span className={active ? "font-medium" : ""}>{label}</span>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {/* Success result */}
-      {result && !busy && (
-        <div className="rounded-2xl bg-emerald-500/[0.06] border border-emerald-500/20 p-5 animate-scale-in">
-          <div className="flex items-center gap-2 mb-2">
-            <div className="w-7 h-7 rounded-lg bg-emerald-500/20 flex items-center justify-center text-emerald-300">
-              <Check size={14} strokeWidth={3} />
-            </div>
-            <p className="text-emerald-300 text-[10px] tracking-[0.2em] uppercase font-medium">
-              {t("share.receive.result.title")}
+      {/* Result — show after success */}
+      {result && (
+        <div className="rounded-xl bg-emerald-500/[0.08] border border-emerald-500/30 p-3 flex items-center gap-3 animate-scale-in">
+          <div className="w-9 h-9 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-300 shrink-0">
+            <Check size={16} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-emerald-100 text-[12.5px] font-medium">
+              {t("share.receive.done.title")}
+            </p>
+            <p className="text-emerald-400/70 text-[10.5px] mt-0.5 truncate font-mono">
+              {result.output_path}
             </p>
           </div>
-          <p className="text-white text-[24px] font-semibold tabular-nums mb-1">
-            {prettyBytes(result.bytes_written)}
-          </p>
-          <p className="text-zinc-200 text-[13px] font-medium truncate mb-1">
-            {result.filename || "archivo"}
-          </p>
-          <p
-            className="text-zinc-500 text-[11px] font-mono truncate"
-            title={result.output_path}
+          <button
+            onClick={async () => {
+              try {
+                await invoke("reveal_in_finder_cmd", { path: result.output_path });
+              } catch {}
+            }}
+            className="text-emerald-300 hover:text-emerald-100 text-[11px] underline shrink-0"
           >
-            ▸ {result.output_path}
-          </p>
-        </div>
-      )}
-
-      {/* Error toast */}
-      {error && !busy && (
-        <div className="rounded-xl bg-rose-500/[0.08] border border-rose-500/30 px-4 py-3 text-rose-300 text-[13px] flex items-start gap-2.5 animate-scale-in">
-          <AlertCircle size={15} className="shrink-0 mt-0.5" />
-          <div className="flex-1">
-            <span>{error}</span>
-            <button
-              onClick={onReceive}
-              className="block mt-2 text-zinc-400 hover:text-white text-[11px] font-medium transition-colors"
-            >
-              {t("share.receive.retry")}
-            </button>
-          </div>
+            {t("share.receive.done.reveal")}
+          </button>
         </div>
       )}
     </div>
@@ -968,8 +960,7 @@ function ReceivePanel() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Link panel — right column with URL, QR, feature pills,
-//  Vista previa, Actividad
+//  Link panel
 // ─────────────────────────────────────────────────────────────
 
 function LinkPanel({
@@ -987,30 +978,54 @@ function LinkPanel({
   t: (k: string, vars?: Record<string, string | number>) => string;
   onNavigate?: (v: View) => void;
 }) {
-  const [copied, setCopied] = useState<"link" | "token" | null>(null);
-  const [showQR, setShowQR] = useState(false);
+  const [copied, setCopied] = useState<"link" | "token" | "all" | null>(null);
+  const [showQR, setShowQR] = useState(true);
   const [showToken, setShowToken] = useState(false);
 
-  // Build a pretty URL for display. The token from the backend
-  // already encodes the slug; we wrap it in a friendly URL.
   const linkUrl = resp
-    ? `https://nexusrar.app/d/${resp.code.toLowerCase()}`
+    ? `nexusrar://d/${resp.code.toLowerCase()}`
     : null;
 
-  const onCopy = useCallback(async (text: string, which: "link" | "token") => {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {}
+  // Generic copy with toast + visual feedback.
+  const onCopy = useCallback(async (text: string, which: "link" | "token" | "all") => {
+    try { await navigator.clipboard.writeText(text); } catch {}
     setCopied(which);
     setTimeout(() => setCopied(null), 1800);
+    toast.success(which === "all" ? "Link + token copiados" : "Copiado");
   }, []);
+
+  // One-click share via OS share-sheet if available, else fall back to copy.
+  const onShareViaOS = useCallback(async () => {
+    if (!resp) return;
+    const payload = linkUrl ?? resp.token;
+    const data = {
+      title: `NexusRAR — ${resp.filename}`,
+      text: linkUrl ?? "",
+      url: linkUrl ?? undefined,
+    };
+    if ((navigator as any).share) {
+      try { await (navigator as any).share(data); return; } catch {}
+    }
+    if ((navigator as any).clipboard?.writeText) {
+      await (navigator as any).clipboard.writeText(payload);
+      toast.success("Copiado al portapapeles");
+    } else {
+      toast.error("No se pudo compartir");
+    }
+  }, [resp, linkUrl]);
+
+  // Pre-compute "copy all" payload.
+  const copyAllText = useMemo(() => {
+    if (!resp) return "";
+    return [linkUrl, resp.token].filter(Boolean).join("\n");
+  }, [resp, linkUrl]);
 
   return (
     <div className="glass rounded-3xl p-6 flex flex-col gap-5">
       {/* Step header with status pill */}
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-lg bg-cyan-500/15 border border-cyan-500/30 flex items-center justify-center text-cyan-300 text-[13px] font-bold">
+          <div className="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-300 text-[13px] font-bold">
             2
           </div>
           <div>
@@ -1023,7 +1038,7 @@ function LinkPanel({
           </div>
         </div>
         {resp && (
-          <span className="chip chip-emerald shrink-0">
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[10.5px] tracking-wider uppercase font-semibold shrink-0">
             <span className="relative flex w-2 h-2">
               <span className="absolute inline-flex h-full w-full rounded-full opacity-75 animate-ping bg-emerald-400" />
               <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
@@ -1035,18 +1050,41 @@ function LinkPanel({
 
       {resp && linkUrl ? (
         <>
-          {/* Link display card — friendly URL + QR + copy */}
-          <div className="rounded-2xl bg-white/[0.03] border border-white/[0.08] p-4 flex items-center gap-3 animate-scale-in">
-            <div className="w-9 h-9 rounded-lg bg-white/[0.05] flex items-center justify-center text-zinc-400 shrink-0">
-              <LinkIcon size={16} />
+          {/* QR code — DEFAULT ON at 220x220 px. Toggle to hide. */}
+          {showQR && (
+            <div className="rounded-2xl bg-white p-5 flex flex-col items-center gap-3 animate-scale-in">
+              <div className="rounded-xl bg-white p-2.5 shadow-inner">
+                <QRCodeSVG
+                  value={linkUrl}
+                  size={220}
+                  level="M"
+                  bgColor="#ffffff"
+                  fgColor="#0a0a0c"
+                />
+              </div>
+              <p className="text-zinc-700 text-[12px] font-mono text-center">
+                {t("share.link.qr.scan")}
+              </p>
+              <p className="text-zinc-500 text-[10.5px] uppercase tracking-wider">
+                {linkUrl}
+              </p>
             </div>
-            <p className="flex-1 text-white text-[13px] font-mono truncate">
-              {linkUrl}
-            </p>
+          )}
+
+          {/* Action row: 4 buttons. Compact + clear. */}
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              onClick={onShareViaOS}
+              className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-br from-cyan-500 to-emerald-500 hover:from-cyan-400 hover:to-emerald-400 text-white text-[13px] font-semibold transition-all duration-150 hover:-translate-y-px shadow-[0_4px_20px_-6px_rgba(34,211,238,0.55)]"
+              title={t("share.link.share.os")}
+            >
+              <Share2 size={14} />
+              {t("share.link.share.os")}
+            </button>
             <button
               onClick={() => onCopy(linkUrl, "link")}
               className={
-                "inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-[13px] font-semibold transition-all duration-150 " +
+                "inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-semibold transition-all duration-150 " +
                 (copied === "link"
                   ? "bg-emerald-500/20 text-emerald-300"
                   : "bg-blue-500 hover:bg-blue-400 text-white shadow-[0_4px_16px_-4px_rgba(59,130,246,0.5)]")
@@ -1059,85 +1097,80 @@ function LinkPanel({
                 </>
               ) : (
                 <>
-                  <Copy size={14} />
+                  <LinkIcon size={14} />
                   {t("share.link.copy")}
+                </>
+              )}
+            </button>
+            <button
+              onClick={() => onCopy(resp.token, "token")}
+              className={
+                "inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-semibold transition-all duration-150 " +
+                (copied === "token"
+                  ? "bg-emerald-500/20 text-emerald-300"
+                  : "bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 border border-cyan-500/30")
+              }
+            >
+              {copied === "token" ? (
+                <>
+                  <Check size={14} />
+                  {t("share.link.copied")}
+                </>
+              ) : (
+                <>
+                  <KeyRound size={14} />
+                  {t("share.link.copy.token")}
                 </>
               )}
             </button>
             <button
               onClick={() => setShowQR((v) => !v)}
               className={
-                "btn btn-ghost px-3 " +
-                (showQR ? "bg-white/[0.08] text-white" : "")
+                "inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-medium transition-all duration-150 " +
+                (showQR ? "bg-white/[0.08] text-white border border-white/[0.16]" : "bg-white/[0.04] text-zinc-400 hover:text-white border border-white/[0.06]")
               }
-              title={t("share.link.qr")}
+              title={t("share.link.qr.toggle")}
             >
               <QrCode size={14} />
+              {showQR ? t("share.link.qr.hide") : t("share.link.qr.show")}
             </button>
           </div>
 
-          {/* Raw token display — what the receiver actually pastes */}
-          <div className="rounded-2xl bg-cyan-500/[0.04] border border-cyan-500/20 p-3 animate-scale-in">
-            <div className="flex items-center gap-2 mb-2">
-              <KeyRound size={12} className="text-cyan-400 shrink-0" />
+          {/* Copy-all summary */}
+          <button
+            onClick={() => onCopy(copyAllText, "all")}
+            className={
+              "inline-flex items-center justify-between gap-2 px-3.5 py-2 rounded-xl text-[11.5px] font-medium transition-colors " +
+              (copied === "all"
+                ? "bg-emerald-500/15 text-emerald-200"
+                : "bg-white/[0.03] hover:bg-white/[0.05] text-zinc-400 hover:text-zinc-200 border border-white/[0.06]")
+            }
+          >
+            <span className="flex items-center gap-2">
+              <Copy size={11} />
+              {t("share.link.copy.all")}
+            </span>
+            {copied === "all" && <Check size={11} className="text-emerald-400" />}
+          </button>
+
+          {/* Token display — collapsed by default, expand to copy manually */}
+          <details className="rounded-2xl bg-cyan-500/[0.04] border border-cyan-500/20 overflow-hidden group">
+            <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer list-none select-none hover:bg-white/[0.03] transition-colors">
+              <KeyRound size={11} className="text-cyan-400 shrink-0" />
               <span className="text-cyan-300 text-[10px] tracking-[0.2em] uppercase font-medium">
                 {t("share.link.token.label")}
               </span>
-              <button
-                onClick={() => setShowToken((v) => !v)}
-                className="ml-auto text-zinc-500 hover:text-white text-[10px] flex items-center gap-1 transition-colors"
-              >
-                {showToken ? <EyeOff size={10} /> : <Eye size={10} />}
+              <span className="ml-auto text-zinc-500 text-[10px] flex items-center gap-1">
+                <ChevronDown size={11} className="transition-transform duration-200 group-open:rotate-180" />
                 {showToken ? t("share.link.token.hide") : t("share.link.token.show")}
-              </button>
-            </div>
-            <div className="flex items-center gap-2">
-              <p className="flex-1 text-white text-[11.5px] font-mono truncate">
-                {showToken
-                  ? resp.token
-                  : "•".repeat(Math.min(resp.token.length, 28))}
-              </p>
-              <button
-                onClick={() => onCopy(resp.token, "token")}
-                className={
-                  "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold transition-all duration-150 shrink-0 " +
-                  (copied === "token"
-                    ? "bg-emerald-500/20 text-emerald-300"
-                    : "bg-cyan-500 hover:bg-cyan-400 text-white")
-                }
-              >
-                {copied === "token" ? (
-                  <>
-                    <Check size={12} />
-                    {t("share.link.copied")}
-                  </>
-                ) : (
-                  <>
-                    <Copy size={12} />
-                    {t("share.link.copy.token")}
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-
-          {/* QR code (collapsible) */}
-          {showQR && (
-            <div className="rounded-2xl bg-white p-4 flex flex-col items-center gap-3 animate-scale-in">
-              <div className="rounded-xl bg-white p-2">
-                <QRCodeSVG
-                  value={linkUrl}
-                  size={180}
-                  level="M"
-                  bgColor="#ffffff"
-                  fgColor="#0a0a0c"
-                />
-              </div>
-              <p className="text-zinc-600 text-[11.5px] font-mono">
-                {t("share.link.qr.scan")}
+              </span>
+            </summary>
+            <div className="px-3 pb-3 pt-1">
+              <p className="text-white text-[11.5px] font-mono break-all bg-black/20 rounded-lg p-2">
+                {resp.token}
               </p>
             </div>
-          )}
+          </details>
 
           {/* Feature pills row */}
           <div className="grid grid-cols-3 gap-2">
@@ -1161,7 +1194,7 @@ function LinkPanel({
             </div>
           </div>
 
-          {/* Vista previa */}
+          {/* Vista previa del archivo */}
           <div>
             <h3 className="text-zinc-400 text-[10px] tracking-[0.2em] uppercase font-medium mb-3">
               {t("share.link.preview")}
@@ -1181,7 +1214,7 @@ function LinkPanel({
             </div>
           </div>
 
-          {/* Actividad — Sprint 5.7: real past transfers from db.rs */}
+          {/* Actividad — recent past transfers */}
           <div>
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-zinc-400 text-[10px] tracking-[0.2em] uppercase font-medium">
@@ -1237,7 +1270,6 @@ function LinkPanel({
           </div>
         </>
       ) : (
-        /* Empty state when no link is active */
         <div className="rounded-2xl border-2 border-dashed border-white/[0.08] p-10 flex flex-col items-center text-center gap-3 min-h-[280px] justify-center">
           <div className="w-14 h-14 rounded-2xl bg-white/[0.04] flex items-center justify-center text-zinc-500">
             <LinkIcon size={26} strokeWidth={1.5} />

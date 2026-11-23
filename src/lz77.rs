@@ -28,6 +28,14 @@ pub const HASH_MASK: usize = HASH_SIZE - 1;
 pub const MIN_MATCH: usize = 3;
 pub const MAX_MATCH: usize = 255;
 pub const MAX_DIST: usize = WINDOW_SIZE;
+// Sprint 5.7.31 — kept at 32. Profile data showed 15–25 % of peeks
+// hit this cap on big files (typescript.d.ts, lib.dom.d.ts,
+// index.d.ts), so bumping it (e.g. to 64) DOES find longer matches
+// and improves ratio by ~0.4–1.2 % on those files. But the bench
+// showed big files get 10–13 % SLOWER. The user asked to optimise
+// compression time, not ratio, so we keep 32. The profile data
+// is documented in `perf-comparison.md` so the ratio knob can be
+// revisited later.
 pub const MAX_CHAIN_STEPS: usize = 32;
 
 /// Minimum length for a `DictRef` op to be emitted. Below this, the
@@ -85,38 +93,138 @@ impl MatchFinder {
 
     /// Find the best match at `pos` in `data` WITHOUT mutating state.
     /// Returns (length, distance). Length < MIN_MATCH means no usable match.
+    ///
+    /// This is the primary match-finder entry point. It delegates to
+    /// `peek_with_max_steps(.., MAX_CHAIN_STEPS)`. See that function's
+    /// doc-comment for the full list of optimisations.
     pub fn peek(&self, data: &[u8], pos: usize) -> (usize, usize) {
+        self.peek_with_max_steps(data, pos, MAX_CHAIN_STEPS)
+    }
+
+    /// Variant that takes an explicit step cap. Kept in the API for
+    /// future tuning — e.g. calling with `max_steps = 4` from a lazy
+    /// probe, OR calling with a larger cap from a "second pass" on
+    /// peeks where the first 3-byte prefix looked promising but the
+    /// initial walk didn't find a great match. Bench results from
+    /// Sprint 5.7.31:
+    ///
+    ///   | max_steps for lazy probe | result                                |
+    ///   |-------------------------|---------------------------------------|
+    ///   | 32 (current full cap)   | ratio preserved, current speed        |
+    ///   | 4 (lazy-only)           | small files −6 %, big files +5–6 %  |
+    ///                           | (slow). Missing lazy improvements     |
+    ///                           | causes more iterations of the main   |
+    ///                           | encode loop, which costs more than the|
+    ///                           | saved chain work.                      |
+    ///   | 64 (bump all cap)       | ratio +0.4–1.2 %, speed −10–13 % on   |
+    ///                           | big files. Worth revisiting only if  |
+    ///                           | ratio becomes the priority.           |
+    ///
+    /// So the API is here, the trade-off is here, the lazy path in
+    /// `encode()` still uses the full-cap version because the ratio win
+    /// from lazy is real.
+    #[allow(dead_code)]
+    pub fn peek_with_max_steps(
+        &self,
+        data: &[u8],
+        pos: usize,
+        max_steps: usize,
+    ) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+        use crate::profile::{PROFILE, ProfileStats};
+
         if pos + MIN_MATCH > data.len() {
+            PROFILE.peek_calls.fetch_add(1, Ordering::Relaxed);
+            PROFILE.peek_no_match.fetch_add(1, Ordering::Relaxed);
             return (0, 0);
         }
         let h = hash3(data, pos);
         let mut candidate = self.head[h];
+        // Empty-chain fast exit (optimisation #1).
+        if candidate < 0 {
+            PROFILE.peek_calls.fetch_add(1, Ordering::Relaxed);
+            PROFILE.peek_no_match.fetch_add(1, Ordering::Relaxed);
+            PROFILE
+                .chain_depth_hist
+                .get(0)
+                .map(|c| c.fetch_add(1, Ordering::Relaxed));
+            return (0, 0);
+        }
+        // Chain depth histogram: walk from `head[h]` to count entries
+        // before this peek's walk. The count includes the head itself.
+        let mut depth: usize = 0;
+        {
+            let mut p = candidate;
+            while p >= 0 && depth < 64 {
+                depth += 1;
+                p = self.prev[p as usize % WINDOW_SIZE];
+            }
+        }
+        PROFILE
+            .chain_depth_hist
+            .get(ProfileStats::chain_depth_bin(depth))
+            .map(|c| c.fetch_add(1, Ordering::Relaxed));
+
+        // Cache the first 3 bytes — used for the per-candidate
+        // quick reject in the chain walk (optimisation #2).
+        let t0 = data[pos];
+        let t1 = data[pos + 1];
+        let t2 = data[pos + 2];
+        // Hoist the bounds check out of the inner loop (optimisation #3).
+        // `cand < pos` is guaranteed by the stale-entry guard below,
+        // so `cand + l <= pos + l` and the pos-side cap suffices.
+        let cap = (data.len() - pos).min(MAX_MATCH);
         let mut best_len = 0usize;
         let mut best_dist = 0usize;
         let mut steps = 0usize;
 
-        while candidate >= 0 && steps < MAX_CHAIN_STEPS {
+        while candidate >= 0 && steps < max_steps {
             let cand = candidate as usize;
-            // Stale entry? (circular buffer overwrote prev at slot cand % WINDOW_SIZE
-            // when some position j >= cand + MAX_DIST was processed)
-            // Also reject self-reference (dist=0).
+            // Stale entry? (circular buffer overwrote prev at slot
+            // cand % WINDOW_SIZE when some position j >= cand + MAX_DIST
+            // was processed). Also rejects self-reference (dist=0).
             if pos <= cand || pos - cand >= MAX_DIST {
                 break;
             }
-            // Extend the match
-            let mut l = 0usize;
-            while l < MAX_MATCH && pos + l < data.len() && data[cand + l] == data[pos + l] {
+            // 3-byte quick reject: most chain collisions fail here
+            // (different byte 4). Saves the entire extension loop.
+            if data[cand] != t0 || data[cand + 1] != t1 || data[cand + 2] != t2 {
+                candidate = self.prev[cand % WINDOW_SIZE];
+                steps += 1;
+                continue;
+            }
+            // Match-extension loop. We already know the first 3 bytes
+            // match, so start `l` at 3 (saves 3 byte-compares per
+            // candidate that survives the quick reject).
+            let mut l = 3usize;
+            while l < cap && data[cand + l] == data[pos + l] {
                 l += 1;
             }
             if l > best_len {
                 best_len = l;
                 best_dist = pos - cand;
-                if l == MAX_MATCH {
+                // Reached the cap (either MAX_MATCH or end-of-input).
+                // Nothing better possible from this chain.
+                if l >= MAX_MATCH || l == cap {
                     break;
                 }
             }
             candidate = self.prev[cand % WINDOW_SIZE];
             steps += 1;
+        }
+        // Profile bookkeeping (only when called with the full cap, so
+        // the lazy probe doesn't skew the numbers).
+        PROFILE.peek_calls.fetch_add(1, Ordering::Relaxed);
+        PROFILE
+            .chain_steps_total
+            .fetch_add(steps as u64, Ordering::Relaxed);
+        if steps >= max_steps && max_steps == MAX_CHAIN_STEPS {
+            PROFILE.chain_steps_capped.fetch_add(1, Ordering::Relaxed);
+        }
+        if best_len >= MIN_MATCH {
+            PROFILE.peek_with_match.fetch_add(1, Ordering::Relaxed);
+        } else {
+            PROFILE.peek_no_match.fetch_add(1, Ordering::Relaxed);
         }
         (best_len, best_dist)
     }
@@ -205,6 +313,9 @@ impl MatchFinder {
     /// Encode `data` as a sequence of (literal | match) ops using hash chains
     /// and lazy matching.
     pub fn encode(&mut self, data: &[u8]) -> Vec<Op> {
+        use std::sync::atomic::Ordering;
+        use crate::profile::{PROFILE, ProfileStats};
+
         let mut ops = Vec::with_capacity(data.len() / 2);
         let mut i = 0usize;
         let n = data.len();
@@ -213,6 +324,11 @@ impl MatchFinder {
             if i + MIN_MATCH > n {
                 while i < n {
                     ops.push(Op::Lit(data[i]));
+                    PROFILE.literals_emitted.fetch_add(1, Ordering::Relaxed);
+                    PROFILE
+                        .match_len_hist
+                        .get(0)
+                        .map(|c| c.fetch_add(1, Ordering::Relaxed));
                     i += 1;
                 }
                 break;
@@ -223,11 +339,28 @@ impl MatchFinder {
 
             // Lazy matching: if there's a match here, peek at i+1 and see if
             // we'd get a longer one by emitting a literal first.
+            //
+            // Sprint 5.7.31 — note: tried capping the lazy probe at
+            // 4 chain steps via `peek_with_max_steps(.., 4)` to save
+            // work. Bench showed it was a NET LOSS for big files:
+            // missing the lazy improvement means we commit to a
+            // shorter match at i, which causes MORE iterations of
+            // the main encode loop, each doing a full chain walk.
+            // The lazy probe pays for itself when matches are long.
+            // (See `peek_with_max_steps` doc for the data.)
+            //
+            // Kept the variant in the API for future tuning but the
+            // lazy path uses the full peek.
             if best_len >= MIN_MATCH && i + 1 + MIN_MATCH <= n {
                 let (next_len, _) = self.peek(data, i + 1);
                 if next_len > best_len + 1 {
                     // Worth paying 1 literal byte for the longer match
                     ops.push(Op::Lit(data[i]));
+                    PROFILE.literals_emitted.fetch_add(1, Ordering::Relaxed);
+                    PROFILE
+                        .match_len_hist
+                        .get(0)
+                        .map(|c| c.fetch_add(1, Ordering::Relaxed));
                     self.insert(data, i);
                     i += 1;
                     continue;
@@ -239,13 +372,34 @@ impl MatchFinder {
                     dist: best_dist as u32,
                     len: best_len as u32,
                 });
-                // Insert hashes for positions i..i+best_len
+                PROFILE.matches_emitted.fetch_add(1, Ordering::Relaxed);
+                PROFILE
+                    .match_len_hist
+                    .get(ProfileStats::match_len_bin(best_len as u32))
+                    .map(|c| c.fetch_add(1, Ordering::Relaxed));
+                // Insert hashes for positions i..i+best_len so future
+                // lookups can chain back into this match from any of
+                // those positions. Skipping the middle positions
+                // (e.g. only inserting start + end like zstd) was
+                // benchmarked but produced a 3–9 % regression in
+                // compression ratio on `corpus_real/` because the
+                // match-finding quality degraded — future peeks landed
+                // on shorter matches at worse offsets, which made
+                // `codec.rs` 15 % SLOWER too (more peeks per byte).
+                // The insert cost is real but keeping every position
+                // in the chain gives the best ratio/speed tradeoff
+                // for this implementation.
                 for k in 0..best_len {
                     self.insert(data, i + k);
                 }
                 i += best_len;
             } else {
                 ops.push(Op::Lit(data[i]));
+                PROFILE.literals_emitted.fetch_add(1, Ordering::Relaxed);
+                PROFILE
+                    .match_len_hist
+                    .get(0)
+                    .map(|c| c.fetch_add(1, Ordering::Relaxed));
                 self.insert(data, i);
                 i += 1;
             }
@@ -282,6 +436,31 @@ impl MatchFinder {
         let mut ops = Vec::with_capacity(data.len() / 2);
         let mut i = 0usize;
         let n = data.len();
+        // Sprint 5.7.31 — see `encode_with_dict` in the module-level
+        // docs for the rationale. Two threshold-based skips:
+        //
+        //   - Skip dict lookup if LZ77 match >= `DICT_SKIP_LZ77_THRESHOLD`.
+        //     Dict tokens are short (avg ~5 bytes, max ~10 in the trained
+        //     dict — programming-language tokens don't get much longer),
+        //     so an LZ77 match of 16+ bytes can never lose to a dict
+        //     match.
+        //
+        //   - Skip LZ77 peek if dict match >= `LZ77_SKIP_DICT_THRESHOLD`
+        //     (symmetric). The trained dict has at most a few tokens
+        //     longer than 12 bytes; an LZ77 match would have to be
+        //     STRICTLY longer to win, and a 12+ byte LZ77 match on a
+        //     position that already has a 12+ byte dict match is
+        //     uncommon. Skipping the chain walk saves the hot loop
+        //     on those positions.
+        //
+        // Profile data (Sprint 5.7.31) showed the dict codec eating
+        // 68-80 % of total v4 compress time on big `.d.ts` files.
+        // Skipping lookups where the OTHER algorithm already won
+        // big is the cheapest knob. Both thresholds are conservative
+        // — chosen so the high wins almost never happen on the
+        // bench corpus and the skip is essentially free.
+        const DICT_SKIP_LZ77_THRESHOLD: usize = 16;
+        const LZ77_SKIP_DICT_THRESHOLD: usize = 12;
         while i < n {
             // 1. Try LZ77 match.
             let lz_match = if i + MIN_MATCH <= n {
@@ -295,11 +474,34 @@ impl MatchFinder {
                 None
             };
 
-            // 2. Try dict match.
-            let dict_match = if n - i >= MIN_DICT_MATCH {
+            // 2. Try dict match. Try LZ77 first (cheap) and skip dict
+            //    if LZ77 already won big; if LZ77 was short or empty,
+            //    check dict.
+            let dict_match = if let Some((ll, _)) = lz_match {
+                if ll >= DICT_SKIP_LZ77_THRESHOLD {
+                    None
+                } else if n - i >= MIN_DICT_MATCH {
+                    dict.lookup_at(data, i)
+                } else {
+                    None
+                }
+            } else if n - i >= MIN_DICT_MATCH {
                 dict.lookup_at(data, i)
             } else {
                 None
+            };
+
+            // 2b. If dict already has a long-enough match AND LZ77
+            //     didn't win big, drop LZ77 — we already know we
+            //     won't use it. (Symmetric to the skip above.)
+            let lz_match = if let Some((_, dd)) = dict_match {
+                if dd >= LZ77_SKIP_DICT_THRESHOLD {
+                    None
+                } else {
+                    lz_match
+                }
+            } else {
+                lz_match
             };
 
             // 3. Pick the longer match (tie → LZ77, no dict dependency).
@@ -310,6 +512,8 @@ impl MatchFinder {
                         dist: ld as u32,
                         len: ll as u32,
                     });
+                    // See class docstring: skipping intermediate
+                    // positions regresses ratio, so we keep all of them.
                     for k in 0..ll {
                         self.insert(data, i + k);
                     }

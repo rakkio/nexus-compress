@@ -123,11 +123,13 @@ where
 
     // Content-defined chunking: variable-size blocks aligned to content
     // boundaries. Each chunk is then dedup'd + LZ77 + rANS compressed.
+    let cdc_start = std::time::Instant::now();
     let chunk_specs: Vec<(usize, usize)> = if input.is_empty() {
         vec![]
     } else {
         cdc::chunkify(input, CDC_MIN_CHUNK, CDC_MAX_CHUNK, CDC_AVG_BITS)
     };
+    crate::profile::add_ns(&crate::profile::PROFILE.cdc_ns, cdc_start);
 
     // Slice the input into chunks per the CDC boundaries
     let chunks: Vec<&[u8]> = chunk_specs
@@ -168,6 +170,7 @@ where
             let original_content = |orig_id: u32| -> Option<Vec<u8>> {
                 unique_contents.get(orig_id as usize).cloned()
             };
+            let dedup_start = std::time::Instant::now();
             match dedup.lookup(block, unique_counter, original_content) {
                 DedupResult::Duplicate { original_id } => {
                     // Emit Duplicate block: payload = [tag][u32 original_id]
@@ -181,6 +184,7 @@ where
                     };
                     bh.write(&mut out).unwrap();
                     out.extend_from_slice(&payload);
+                    crate::profile::add_ns(&crate::profile::PROFILE.dedup_ns, dedup_start);
                     continue;
                 }
                 DedupResult::Unique { .. } => {
@@ -189,9 +193,11 @@ where
                     // normal-compression path below.
                 }
             }
+            crate::profile::add_ns(&crate::profile::PROFILE.dedup_ns, dedup_start);
         }
 
         // Normal compression path
+        let classify_start = std::time::Instant::now();
         let mut block_type = if block.is_empty() {
             BlockType::Unknown
         } else {
@@ -208,6 +214,7 @@ where
         } else {
             crate::classifier::compute_stats(block)
         };
+        crate::profile::add_ns(&crate::profile::PROFILE.classify_ns, classify_start);
         let payload = encode_block(block, &mut block_type, &stats);
         let bh = BlockHeader {
             block_type,
@@ -282,10 +289,13 @@ fn encode_block(block: &[u8], block_type: &mut BlockType, stats: &BlockStats) ->
     // (select != NONE) and the block is large enough that the table
     // overhead (≈5 KB for 5 tables) is amortized.
     let dict_path = if block.len() >= 8 * 1024 && crate::dict_codec::should_try_v45(block) {
-        crate::dict_codec::encode_v45_multistream(block).map(|mut payload| {
+        let d_start = std::time::Instant::now();
+        let result = crate::dict_codec::encode_v45_multistream(block).map(|mut payload| {
             payload.insert(0, TAG_V3_MULTISTREAM_DICT);
             payload
-        })
+        });
+        crate::profile::add_ns(&crate::profile::PROFILE.dict_ns, d_start);
+        result
     } else {
         None
     };
@@ -306,10 +316,13 @@ fn encode_block(block: &[u8], block_type: &mut BlockType, stats: &BlockStats) ->
     // is self-gating: `select_local_dict_ids` returns 0 matches for
     // truly random blocks, so the function returns None cheaply.
     let local_path = if block.len() >= 8 * 1024 && crate::dict_codec::quick_entropy_gate(block) {
-        crate::dict_codec::encode_v45_multistream_local(block).map(|mut payload| {
+        let d_start = std::time::Instant::now();
+        let result = crate::dict_codec::encode_v45_multistream_local(block).map(|mut payload| {
             payload.insert(0, TAG_V3_MULTISTREAM_DICT);
             payload
-        })
+        });
+        crate::profile::add_ns(&crate::profile::PROFILE.dict_ns, d_start);
+        result
     } else {
         None
     };
@@ -364,8 +377,12 @@ fn encode_v3_multistream(data: &[u8]) -> Option<Vec<u8>> {
     //    coarse to consistently beat lazy's greedy+1-lookahead.
     //    See "Sprint 2.9: optimal parser (the final boss)" in
     //    README for the full bench.
+    //
+    // Sprint 5.7.31 — profile: time LZ77 vs op-split vs rANS.
+    let lz77_start = std::time::Instant::now();
     let mut mf = MatchFinder::new();
     let ops = mf.encode(data);
+    crate::profile::add_ns(&crate::profile::PROFILE.lz77_ns, lz77_start);
 
     // 2. Split ops into THREE independent streams for v3.
     //
@@ -382,6 +399,7 @@ fn encode_v3_multistream(data: &[u8]) -> Option<Vec<u8>> {
     let mut lengths: Vec<u8> = Vec::new();
     let mut dist_lows: Vec<u8> = Vec::new();
     let mut dist_highs: Vec<u8> = Vec::new();
+    let split_start = std::time::Instant::now();
     for op in &ops {
         match op {
             Op::Lit(b) => literals.push(*b),
@@ -396,6 +414,7 @@ fn encode_v3_multistream(data: &[u8]) -> Option<Vec<u8>> {
             ),
         }
     }
+    crate::profile::add_ns(&crate::profile::PROFILE.op_split_ns, split_start);
 
     // 3. Build frequency tables and rANS-encode each stream.
     //
@@ -413,6 +432,8 @@ fn encode_v3_multistream(data: &[u8]) -> Option<Vec<u8>> {
         crate::rans_v4::sparse_rans_encode_u8(&dist_lows, 12);
     let (dist_hi_table_section, dist_hi_stream) =
         crate::rans_v4::sparse_rans_encode_u8(&dist_highs, 12);
+    // Note: sparse_rans_encode_u8 already records its own time
+    // internally — see crate::rans_v4 — so we don't double-count.
 
     // 4. Op-flags stream (one byte per op: 0 = literal, 1 = match).
     let mut ops_bytes = Vec::with_capacity(ops.len() + 4);

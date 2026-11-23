@@ -7,6 +7,7 @@
 //!   nexus c <dir>  <output.nxar>        # compress a directory
 //!   nexus d <input.nexus|nxar|nxe|nxr> <output>
 //!   nexus bench                          # run corpus benchmark
+//!   nexus profile <input> [output]       # compress + print per-file profile stats
 //!
 //! Compression backends (v4 default, v5 = LZMA via xz2, v6 = v5 + smart preprocessor):
 //!   v4          — multi-stream LZ77 + rANS + dict codec (default)
@@ -85,6 +86,7 @@ fn main() {
     let mut lzma_level: Option<u32> = None;
     let mut password: Option<String> = None;
     let mut recovery: Option<String> = None;
+    let mut split_mb: Option<usize> = None;
     let mut positional: Vec<String> = Vec::new();
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -105,6 +107,9 @@ fn main() {
             }
             "--recovery" => {
                 recovery = iter.next().cloned();
+            }
+            "--split" | "--volume" => {
+                split_mb = iter.next().and_then(|s| s.parse().ok());
             }
             "-h" | "--help" => {
                 print_help();
@@ -147,27 +152,26 @@ fn main() {
                             }
                         })
                         .unwrap_or(6);
-                    let files = walk_dir(input).expect("walk dir");
-                    if files.is_empty() {
-                        eprintln!("error: directory has no files: {}", positional[1]);
-                        std::process::exit(2);
-                    }
-                    let original_total: usize = files.iter().map(|(_, b)| b.len()).sum();
                     let t0 = std::time::Instant::now();
-                    let archive = nexus_compress::solid_archive::compress(&files, level)
+                    let (n_files, original_total, archive_len) =
+                        nexus_compress::solid_archive::compress_dir_streaming(
+                            input,
+                            level,
+                            Path::new(output),
+                            split_mb,
+                        )
                         .expect("solid compress");
                     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    fs::write(output, &archive).expect("write output");
-                    let ratio = original_total as f64 / archive.len().max(1) as f64;
+                    let ratio = original_total as f64 / archive_len.max(1) as f64;
                     eprintln!(
                         "{} -> {} (SOLID v6 LZMA {}, {:.2}x, {} files, {} bytes -> {} bytes, {:.0} ms)",
                         positional[1],
                         output,
                         level,
                         ratio,
-                        files.len(),
+                        n_files,
                         original_total,
-                        archive.len(),
+                        archive_len,
                         ms,
                     );
                 } else {
@@ -180,7 +184,7 @@ fn main() {
                         nexus_compress::api::CompressionLevel::Fast,
                     )
                     .expect("compress directory");
-                    fs::write(output, &archive).expect("write output");
+                    write_output_maybe_split(output, &archive, split_mb);
                     eprintln!(
                         "{} -> {} ({:.2}x), {} files, {} bytes -> {} bytes",
                         positional[1],
@@ -221,7 +225,7 @@ fn main() {
                         preset: KdfPreset::Interactive,
                     };
                     let out = compress_encrypted(&bytes, &opts, |_ev| {}).expect("compress encrypted");
-                    fs::write(output, &out).expect("write output");
+                    write_output_maybe_split(output, &out, split_mb);
                     let ratio = bytes.len() as f64 / out.len().max(1) as f64;
                     let label = match recovery_level {
                         RecoveryLevel::Off => "NXE",
@@ -244,7 +248,7 @@ fn main() {
                     } else {
                         engine::compress_with(backend_name, &bytes, minify).expect("compress")
                     };
-                    fs::write(output, &out).expect("write output");
+                    write_output_maybe_split(output, &out, split_mb);
                     let ratio = bytes.len() as f64 / out.len().max(1) as f64;
                     eprintln!(
                         "{} -> {} ({:.2}x, {})",
@@ -258,7 +262,7 @@ fn main() {
                 eprintln!("usage: nexus d [OPTIONS] <input> <output>");
                 std::process::exit(2);
             }
-            let input = fs::read(&positional[1]).expect("read input");
+            let input = read_input_maybe_multipart(&positional[1]);
             // Auto-detect by magic.
             //
             // Order matters: check the encrypted magics FIRST
@@ -289,7 +293,9 @@ fn main() {
                     positional[2],
                     out.len()
                 );
-            } else if input.len() >= 5 && &input[0..5] == nexus_compress::solid_archive::MAGIC {
+            } else if (input.len() >= 5 && &input[0..5] == nexus_compress::solid_archive::MAGIC)
+                || (input.len() >= 5 && &input[0..4] == b"NXS\0" && input[4] == 1)
+            {
                 // NXS6 solid archive. Output is a directory; we
                 // write the preprocessed bytes of each file. LOSSY.
                 let out_path = Path::new(&positional[2]);
@@ -339,6 +345,32 @@ fn main() {
             eprintln!("`nexus bench` is moved to the bench_suite binary. Run:");
             eprintln!("    cargo run --release --bin bench_suite");
         }
+        "profile" => {
+            // Sprint 5.7.31 — compress a file and print the engine
+            // profile counters on exit. Useful for figuring out
+            // WHERE the encoder spends time before deciding on
+            // optimisations.
+            if positional.len() < 2 {
+                eprintln!("usage: nexus profile <input> [output]");
+                std::process::exit(2);
+            }
+            let input = fs::read(&positional[1]).expect("read input");
+            // The ProfileGuard resets the counters on construction
+            // and prints the report on drop. The Drop also fires
+            // on early exit (panic), which is exactly what we want.
+            let _guard = nexus_compress::profile::ProfileGuard::new();
+            let result = nexus_compress::api::compress_bytes(&input);
+            // Write the output file if asked, otherwise drop it.
+            if let Some(out_path) = positional.get(2) {
+                fs::write(out_path, &result.compressed).expect("write output");
+            }
+            eprintln!(
+                "{} -> {} bytes (ratio {:.3})",
+                positional[1],
+                result.compressed.len(),
+                input.len() as f64 / result.compressed.len().max(1) as f64
+            );
+        }
         _ => {
             eprintln!("unknown subcommand: {}", sub);
             print_help();
@@ -373,4 +405,70 @@ fn walk_dir(root: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     walk(root, root, &mut out)?;
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
+}
+
+fn write_output_maybe_split(output: &str, data: &[u8], split_mb: Option<usize>) {
+    let chunk_bytes = split_mb
+        .filter(|&mb| mb > 0)
+        .map(|mb| mb.saturating_mul(1024 * 1024));
+    if let Some(limit) = chunk_bytes {
+        if data.len() > limit {
+            let _ = fs::remove_file(output);
+            let mut idx = 1usize;
+            for chunk in data.chunks(limit) {
+                let part_path = format!("{}.{:03}", output, idx);
+                fs::write(&part_path, chunk).expect("write split volume");
+                idx += 1;
+            }
+            eprintln!("split into {} volume(s) ({} MB each max)", idx - 1, split_mb.unwrap());
+            return;
+        }
+    }
+    fs::write(output, data).expect("write output");
+}
+
+fn read_input_maybe_multipart(path: &str) -> Vec<u8> {
+    let p = Path::new(path);
+    let base = if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+        if ext.len() == 3 && ext.chars().all(|c| c.is_ascii_digit()) {
+            let stem = path.strip_suffix(&format!(".{}", ext)).unwrap_or(path);
+            Some(stem.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(prefix) = base {
+        let mut combined = Vec::new();
+        let mut idx = 1usize;
+        loop {
+            let part = format!("{}.{:03}", prefix, idx);
+            if !Path::new(&part).exists() {
+                break;
+            }
+            combined.extend_from_slice(&fs::read(&part).expect("read split volume"));
+            idx += 1;
+        }
+        if !combined.is_empty() {
+            return combined;
+        }
+    }
+
+    if !p.exists() && Path::new(&format!("{}.001", path)).exists() {
+        let mut combined = Vec::new();
+        let mut idx = 1usize;
+        loop {
+            let part = format!("{}.{:03}", path, idx);
+            if !Path::new(&part).exists() {
+                break;
+            }
+            combined.extend_from_slice(&fs::read(&part).expect("read split volume"));
+            idx += 1;
+        }
+        return combined;
+    }
+
+    fs::read(path).expect("read input")
 }

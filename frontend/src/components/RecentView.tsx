@@ -13,7 +13,7 @@
  *     in the compress/decompress/share views shows up here).
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useLocale } from "@/components/LocaleProvider";
 import type { View } from "@/components/NeoTopBar";
@@ -38,6 +38,9 @@ import {
   MoreHorizontal,
   RefreshCw,
   AlertCircle,
+  Copy,
+  Trash2,
+  ExternalLink,
 } from "lucide-react";
 
 // ── Tauri-side types (mirror db.rs) ───────────────────────────
@@ -131,11 +134,26 @@ export function RecentView({ ops, onNavigate, onClear }: RecentViewProps) {
     const onFocus = () => fetchData();
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, []);
 
   // Prefer remote data; fall back to in-memory if Tauri isn't available.
-  const opsList = remoteOps ?? ops;
+  // Local hidden-ids set: tracks rows the user removed via the
+  // three-dot menu. Cleared whenever the remote list refreshes so
+  // an item that re-appears on refresh is shown again.
+  const [hiddenIds, setHiddenIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    // Whenever the remote list reference changes (new fetch), reset.
+    setHiddenIds(new Set());
+  }, [remoteOps]);
+  const opsList = (remoteOps ?? ops).filter((op) => !hiddenIds.has(op.id));
+  const handleRemoved = (id: string) => {
+    setHiddenIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  };
 
   const filtered = useMemo(() => {
     let list = opsList;
@@ -287,6 +305,7 @@ export function RecentView({ ops, onNavigate, onClear }: RecentViewProps) {
                         op={op}
                         onNavigate={onNavigate}
                         labels={kindLabels(t)}
+                        onRemoved={handleRemoved}
                       />
                     ))}
                   </div>
@@ -641,10 +660,12 @@ function RecentTableRow({
   op,
   onNavigate,
   labels,
+  onRemoved,
 }: {
   op: RecentOp;
   onNavigate: (v: View) => void;
   labels: ReturnType<typeof kindLabels>;
+  onRemoved?: (id: string) => void;
 }) {
   const meta = labels[op.kind] ?? labels.compress;
   const Icon = meta.icon;
@@ -692,15 +713,134 @@ function RecentTableRow({
       <span className="text-zinc-500 text-[11.5px]">
         {relativeTime(op.timestamp)}
       </span>
-      {/* Action button */}
+      {/* Action button — three-dot menu */}
+      <div className="justify-self-end">
+        <RowActionsMenu
+          op={op}
+          onNavigate={onNavigate}
+          onRemoved={(id) => onRemoved?.(id)}
+        />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Three-dot menu for a recent op row. Closes on outside-click and
+ * provides three actions:
+ *   - "Reveal in folder"  → invokes `reveal_in_finder_cmd` (Tauri)
+ *   - "Copy path"          → writes the file path to the clipboard
+ *   - "Remove from list"   → hides from the local in-memory list
+ *
+ * When run under `next dev` (no Tauri), the Reveal action is
+ * disabled with a tooltip explaining why.
+ */
+function RowActionsMenu({
+  op,
+  onNavigate,
+  onRemoved,
+}: {
+  op: RecentOp;
+  onNavigate: (v: View) => void;
+  onRemoved: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState<"path" | null>(null);
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  // Close on outside click.
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [open]);
+
+  const reveal = async () => {
+    setOpen(false);
+    try {
+      await invoke("reveal_in_finder_cmd", { path: op.filename });
+    } catch {
+      // ignore — falls back silently when Tauri isn't available
+    }
+  };
+
+  const copyPath = async () => {
+    setOpen(false);
+      await navigator.clipboard.writeText(op.filename);
+      setCopied("path");
+      setTimeout(() => setCopied(null), 1400);
+  };
+
+  const remove = () => {
+    setOpen(false);
+    onRemoved(op.id);
+  };
+
+  // Build a usable display path. The RecentView stores just the
+  // filename (e.g. "my-doc.pdf") so for "Reveal in folder" we
+  // pass the parent directory; for "Copy path" we copy the
+  // filename as-is.
+  const parentPath = op.filename.includes("/")
+    ? op.filename.substring(0, op.filename.lastIndexOf("/"))
+    : "";
+
+  return (
+    <div className="relative" ref={ref}>
       <button
         onClick={(e) => {
           e.stopPropagation();
+          setOpen((o) => !o);
         }}
-        className="text-zinc-500 hover:text-white p-1.5 rounded-md hover:bg-white/[0.05] transition-colors justify-self-end"
+        className="text-zinc-500 hover:text-white p-1.5 rounded-md hover:bg-white/[0.05] transition-colors"
+        title="Acciones"
+        aria-label="Acciones"
       >
         <MoreHorizontal size={14} />
       </button>
+      {open && (
+        <div
+          role="menu"
+          onClick={(e) => e.stopPropagation()}
+          className="absolute right-0 top-9 z-30 w-52 rounded-xl border border-white/[0.10] shadow-2xl py-1.5 animate-scale-in"
+          style={{
+            background: "rgba(22, 22, 26, 0.95)",
+            backdropFilter: "blur(14px) saturate(160%)",
+            WebkitBackdropFilter: "blur(14px) saturate(160%)",
+          }}
+        >
+          <button
+            onClick={reveal}
+            disabled={!parentPath}
+            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12.5px] text-zinc-200 hover:bg-white/[0.06] disabled:opacity-40 disabled:cursor-not-allowed text-left transition-colors"
+          >
+            <FolderOpen size={13} className="text-cyan-400" />
+            <span className="flex-1">Reveal in folder</span>
+            <ExternalLink size={11} className="text-zinc-600" />
+          </button>
+          <button
+            onClick={copyPath}
+            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12.5px] text-zinc-200 hover:bg-white/[0.06] text-left transition-colors"
+          >
+            {copied === "path" ? (
+              <Check size={13} className="text-emerald-400" />
+            ) : (
+              <Copy size={13} className="text-cyan-400" />
+            )}
+            <span className="flex-1">{copied === "path" ? "Copied!" : "Copy path"}</span>
+          </button>
+          <div className="my-1 border-t border-white/[0.06]" />
+          <button
+            onClick={remove}
+            className="w-full flex items-center gap-2.5 px-3 py-2 text-[12.5px] text-zinc-200 hover:bg-rose-500/15 hover:text-rose-300 text-left transition-colors"
+          >
+            <Trash2 size={13} className="text-rose-400" />
+            <span className="flex-1">Remove from list</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 }

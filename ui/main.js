@@ -908,7 +908,6 @@ function renderFileList(result, isLive) {
   }
   els.fileListBody.replaceChildren(frag);
 }
-}
 
 // -----------------------------------------------------------------------
 // Action runners — wire each action to its handler
@@ -1263,8 +1262,53 @@ async function loadEngineInfo() {
   }
 }
 
+async function checkGithubUpdate(manual = false) {
+  const btn = $("btn-check-update");
+  const banner = $("update-banner");
+  const verEl = $("app-version");
+  if (btn && manual) btn.textContent = "checking…";
+  try {
+    const res = await invoke("check_github_update_cmd");
+    if (verEl && res.current_version) {
+      verEl.textContent = `v${res.current_version}`;
+    }
+    if (res.has_update && banner) {
+      banner.hidden = false;
+      banner.textContent = `★ v${res.latest_version} available · download`;
+      banner.title = res.release_notes || `Open ${res.release_url}`;
+      banner.onclick = () => invoke("open_external_url_cmd", { url: res.release_url });
+      log("info", `GitHub update available: v${res.latest_version} (${res.release_url})`);
+    } else if (manual) {
+      log("ok", `NexusRAR v${res.current_version} is up to date.`);
+    }
+  } catch (e) {
+    if (manual) log("warn", `update check failed: ${e}`);
+  } finally {
+    if (btn) btn.textContent = "↻ check updates";
+  }
+}
+
+window.getSplitChunkMb = () => Number($("split-select")?.value || 0);
+
 window.addEventListener("DOMContentLoaded", () => {
   log("info", "NexusRAR booting…");
   renderUI();
   loadEngineInfo();
+  checkGithubUpdate(false);
+
+  const btnUpdate = $("btn-check-update");
+  if (btnUpdate) {
+    btnUpdate.addEventListener("click", () => checkGithubUpdate(true));
+  }
+
+  window.addEventListener("keydown", (ev) => {
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "o") {
+      ev.preventDefault();
+      if (ev.shiftKey) {
+        els.btnPickFolder?.click();
+      } else {
+        els.btnPickFile?.click();
+      }
+    }
+  });
 });
