@@ -46,6 +46,7 @@ pub mod format_v2;
 pub mod fs;
 pub mod lz77;
 pub mod minify;
+pub mod nx6r;
 pub mod nxar;
 pub mod ram;
 pub mod rans_v4;

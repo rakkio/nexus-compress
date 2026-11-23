@@ -188,6 +188,23 @@ pub fn lzma_stream_for_requested_preset(requested_preset: u32) -> Result<Stream,
         .map_err(|e| format!("{:?}", e))
 }
 
+/// Cap parallel encoder threads based on free RAM and LZMA2 preset dictionary size
+/// so multi-threaded `EXT_CHUNKS` compression does not OOM on 2–4 GiB VPS nodes.
+pub fn clamp_threads_for_ram(requested_threads: usize, preset: u32) -> usize {
+    let req = requested_threads.max(1);
+    let idx = (preset as usize).min(PRESET_DICT_MIB.len() - 1);
+    let dict_mib = PRESET_DICT_MIB[idx];
+    let per_thread_mib = (dict_mib * 12).max(32);
+    match available_memory_mb() {
+        Some(avail_mib) => {
+            let budget_mib = (avail_mib / 2).max(per_thread_mib);
+            let max_by_ram = (budget_mib / per_thread_mib).max(1) as usize;
+            req.min(max_by_ram)
+        }
+        None => req,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

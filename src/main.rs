@@ -40,6 +40,10 @@ fn print_help() {
     eprintln!("nexus CLI — NexusCompress v4 + v5 LZMA + v6 AST-aware + v6-solid + NXE/NXR encrypted");
     eprintln!();
     eprintln!("USAGE:");
+    eprintln!("    nexus pack [OPTIONS] <input> [-o <output.nxs>]");
+    eprintln!("    nexus unpack <archive.nxs> [-o <output>]");
+    eprintln!("    nexus verify <archive.nxs>");
+    eprintln!("    nexus info <archive.nxs>");
     eprintln!("    nexus c [OPTIONS] <input> <output>");
     eprintln!("    nexus d [OPTIONS] <input> <output>");
     eprintln!("    nexus bench");
@@ -87,6 +91,9 @@ fn main() {
     let mut password: Option<String> = None;
     let mut recovery: Option<String> = None;
     let mut split_mb: Option<usize> = None;
+    let mut out_opt: Option<String> = None;
+    let mut threads_opt: Option<usize> = None;
+    let mut no_apk_unpack = false;
     let mut positional: Vec<String> = Vec::new();
     while let Some(a) = iter.next() {
         match a.as_str() {
@@ -99,8 +106,17 @@ fn main() {
             "--solid" => {
                 solid = true;
             }
-            "--level" => {
+            "--level" | "-l" => {
                 lzma_level = iter.next().and_then(|s| s.parse().ok());
+            }
+            "--output" | "-o" => {
+                out_opt = iter.next().cloned();
+            }
+            "--threads" | "-t" => {
+                threads_opt = iter.next().and_then(|s| s.parse().ok());
+            }
+            "--no-apk-unpack" => {
+                no_apk_unpack = true;
             }
             "--password" => {
                 password = iter.next().cloned();
@@ -130,6 +146,107 @@ fn main() {
     }
     let sub = positional[0].as_str();
     match sub {
+        "pack" => {
+            if positional.len() < 2 {
+                eprintln!("usage: nexus pack <input> [-o <output.nxs>] [--level N] [--threads N]");
+                std::process::exit(2);
+            }
+            let input = Path::new(&positional[1]);
+            let output_path = out_opt
+                .as_deref()
+                .map(Path::new)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| input.with_extension("nxs"));
+            let level = lzma_level.unwrap_or(6);
+            let t0 = std::time::Instant::now();
+            match nexus_compress::nx6r::pack_nx6r(
+                input,
+                &output_path,
+                level,
+                !no_apk_unpack,
+                threads_opt,
+            ) {
+                Ok((raw_bytes, comp_bytes, sha)) => {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    let saved_pct = if raw_bytes > 0 {
+                        (raw_bytes.saturating_sub(comp_bytes)) as f64 / raw_bytes as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "OK: {} ({} B -> {} B | ahorro {:.2}% | {:.0} ms | sha256={}...)",
+                        output_path.display(),
+                        raw_bytes,
+                        comp_bytes,
+                        saved_pct,
+                        ms,
+                        &sha[..12]
+                    );
+                }
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "unpack" => {
+            if positional.len() < 2 {
+                eprintln!("usage: nexus unpack <archive.nxs> [-o <output>]");
+                std::process::exit(2);
+            }
+            let archive = Path::new(&positional[1]);
+            let out = out_opt
+                .as_deref()
+                .map(Path::new)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| archive.with_extension(""));
+            match nexus_compress::nx6r::unpack_nx6r(archive, &out) {
+                Ok(files) => eprintln!("OK: {} file(s) extracted to {}", files.len(), out.display()),
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "verify" => {
+            if positional.len() < 2 {
+                eprintln!("usage: nexus verify <archive.nxs>");
+                std::process::exit(2);
+            }
+            let archive = Path::new(&positional[1]);
+            match nexus_compress::nx6r::verify_nx6r(archive) {
+                Ok(n) => eprintln!("OK: {} verified ({} entries SHA-256 valid)", archive.display(), n),
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "info" => {
+            if positional.len() < 2 {
+                eprintln!("usage: nexus info <archive.nxs>");
+                std::process::exit(2);
+            }
+            let archive = Path::new(&positional[1]);
+            match nexus_compress::nx6r::read_info(archive) {
+                Ok(info) => {
+                    println!("File:        {}", archive.display());
+                    println!("Format:      NXS v2 (version={}, extensions={})", info.version, info.n_extensions);
+                    println!("NXS Size:    {} B", info.file_size);
+                    println!("Raw Size:    {} B", info.raw_total_bytes);
+                    println!("TOC Entries: {} | SHA-256: {}", info.toc_entries.len(), info.sha256_map.len());
+                    println!("XZ Chunks:   {}", info.chunks.len().max(1));
+                    if !info.apk_manifests.is_empty() {
+                        let names: Vec<_> = info.apk_manifests.iter().map(|m| m.apk_name.as_str()).collect();
+                        println!("APKs:        {}", names.join(", "));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "c" | "compress" => {
             if positional.len() < 3 {
                 eprintln!("usage: nexus c [OPTIONS] <input> <output>");
