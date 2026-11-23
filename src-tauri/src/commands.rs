@@ -1900,12 +1900,15 @@ pub async fn check_github_update_cmd() -> Result<GithubUpdateInfo, String> {
                     .unwrap_or("https://github.com/bierfor/nexus-compress/releases");
                 let body = json.get("body").and_then(|v| v.as_str()).unwrap_or("");
                 let has_update = parse_semver_tuple(tag) > parse_semver_tuple(&current);
+                let latest_version = tag.trim_start_matches(['v', 'V']).to_string();
+                let release_url = html_url.to_string();
+                let release_notes = body.chars().take(400).collect();
                 return Ok(GithubUpdateInfo {
                     has_update,
                     current_version: current,
-                    latest_version: tag.trim_start_matches(['v', 'V']).to_string(),
-                    release_url: html_url.to_string(),
-                    release_notes: body.chars().take(400).collect(),
+                    latest_version,
+                    release_url,
+                    release_notes,
                 });
             }
         }
@@ -1919,10 +1922,11 @@ pub async fn check_github_update_cmd() -> Result<GithubUpdateInfo, String> {
                 if let Some(first) = arr.first() {
                     let tag = first.get("name").and_then(|v| v.as_str()).unwrap_or(&current);
                     let has_update = parse_semver_tuple(tag) > parse_semver_tuple(&current);
+                    let latest_version = tag.trim_start_matches(['v', 'V']).to_string();
                     return Ok(GithubUpdateInfo {
                         has_update,
                         current_version: current,
-                        latest_version: tag.trim_start_matches(['v', 'V']).to_string(),
+                        latest_version,
                         release_url: "https://github.com/bierfor/nexus-compress/releases".to_string(),
                         release_notes: String::new(),
                     });
