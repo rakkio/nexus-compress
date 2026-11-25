@@ -5,7 +5,7 @@
 
 [![License: AGPL-3.0 + Commercial](https://img.shields.io/badge/license-AGPL--3.0%20%2B%20Commercial-blue.svg)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#installation)
-[![CI](https://github.com/bierfor/nexus-compress/actions/workflows/ci.yml/badge.svg)](https://github.com/bierfor/nexus-compress/actions)
+[![CI](https://github.com/rakkio/nexus-compress/actions/workflows/ci.yml/badge.svg)](https://github.com/rakkio/nexus-compress/actions)
 [![Tests](https://img.shields.io/badge/tests-149%20passing-brightgreen.svg)](#development)
 
 [English](#english) · [Español](#español) · [Italiano](#italiano)
@@ -75,7 +75,7 @@ Pricing is company-size based (not per-seat). Indie / startup tier is free.
 ### Installation
 
 Download a release for your platform from the
-[Releases page](https://github.com/bierfor/nexus-compress/releases):
+[Releases page](https://github.com/rakkio/nexus-compress/releases):
 
 - macOS (universal: Apple Silicon + Intel, signed + notarised)
 - Linux (`.deb`, `.rpm`, `.AppImage`)
@@ -102,7 +102,7 @@ macOS Sequoia (dialog opens but selection doesn't register with
 `titleBarStyle: "Overlay"` frameless windows). All three input panels
 support **drag-and-drop**, **paste-the-path** (`Cmd+Opt+C` in Finder
 copies pathname → `Cmd+V` into the input), and the picker as a tertiary
-fallback. See the in-app hint or [TAURI-PITFALLS](https://github.com/bierfor/nexus-compress/blob/master/CONTRIBUTING.md#file-picker-on-macos-sequoia).
+fallback. See the in-app hint or [TAURI-PITFALLS](https://github.com/rakkio/nexus-compress/blob/master/CONTRIBUTING.md#file-picker-on-macos-sequoia).
 
 ### Development
 
@@ -167,7 +167,7 @@ Precios según tamaño de empresa (no por asiento). El tier Indie/startup es gra
 ### Instalación
 
 Descargá un release para tu plataforma desde la
-[página de Releases](https://github.com/bierfor/nexus-compress/releases):
+[página de Releases](https://github.com/rakkio/nexus-compress/releases):
 
 - macOS (universal: Apple Silicon + Intel, signed + notarised)
 - Linux (`.deb`, `.rpm`, `.AppImage`)
@@ -230,7 +230,7 @@ Indie/startup è gratuito.
 ### Installazione
 
 Scarica una release per la tua piattaforma dalla
-[pagina Releases](https://github.com/bierfor/nexus-compress/releases):
+[pagina Releases](https://github.com/rakkio/nexus-compress/releases):
 
 - macOS (universale: Apple Silicon + Intel, firmato e notarizzato)
 - Linux (`.deb`, `.rpm`, `.AppImage`)

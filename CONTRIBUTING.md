@@ -164,7 +164,7 @@ You'll also want:
 
 ```bash
 # 1. Clone
-git clone https://github.com/bierfor/nexus-compress.git
+git clone https://github.com/rakkio/nexus-compress.git
 cd nexus-compress
 
 # 2. Engine only (CLI benchmarks, no GUI)
@@ -293,7 +293,7 @@ public PR. Follow [SECURITY.md](./SECURITY.md) instead.
 
 ## Filing issues
 
-Use [GitHub Issues](https://github.com/bierfor/nexus-compress/issues).
+Use [GitHub Issues](https://github.com/rakkio/nexus-compress/issues).
 Please include:
 
 - OS + version (e.g. "macOS 15.4 (Sequoia)", "Ubuntu 24.04 LTS",

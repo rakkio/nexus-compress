@@ -449,9 +449,9 @@ export function AboutPanel() {
       <InfoRow label={t("settings.about.engine")} value="NexusCompress v6 Solid-AST" mono />
       <InfoRow
         label="GitHub"
-        value="github.com/bierfor/nexus-compress"
+        value="github.com/rakkio/nexus-compress"
         mono
-        href="https://github.com/bierfor/nexus-compress"
+        href="https://github.com/rakkio/nexus-compress"
       />
       <InfoRow label="Localización" value={locale.toUpperCase()} mono />
     </Section>

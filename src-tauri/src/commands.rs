@@ -1889,7 +1889,7 @@ pub async fn check_github_update_cmd() -> Result<GithubUpdateInfo, String> {
         .build()
         .map_err(|e| format!("http client: {}", e))?;
 
-    let rel_url = "https://api.github.com/repos/bierfor/nexus-compress/releases/latest";
+    let rel_url = "https://api.github.com/repos/rakkio/nexus-compress/releases/latest";
     if let Ok(resp) = client.get(rel_url).send().await {
         if resp.status().is_success() {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
@@ -1897,7 +1897,7 @@ pub async fn check_github_update_cmd() -> Result<GithubUpdateInfo, String> {
                 let html_url = json
                     .get("html_url")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("https://github.com/bierfor/nexus-compress/releases");
+                    .unwrap_or("https://github.com/rakkio/nexus-compress/releases");
                 let body = json.get("body").and_then(|v| v.as_str()).unwrap_or("");
                 let has_update = parse_semver_tuple(tag) > parse_semver_tuple(&current);
                 let latest_version = tag.trim_start_matches(['v', 'V']).to_string();
@@ -1915,7 +1915,7 @@ pub async fn check_github_update_cmd() -> Result<GithubUpdateInfo, String> {
     }
 
     // Fallback to tags if no formal GitHub Release exists yet
-    let tags_url = "https://api.github.com/repos/bierfor/nexus-compress/tags?per_page=1";
+    let tags_url = "https://api.github.com/repos/rakkio/nexus-compress/tags?per_page=1";
     if let Ok(resp) = client.get(tags_url).send().await {
         if resp.status().is_success() {
             if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
@@ -1927,7 +1927,7 @@ pub async fn check_github_update_cmd() -> Result<GithubUpdateInfo, String> {
                         has_update,
                         current_version: current,
                         latest_version,
-                        release_url: "https://github.com/bierfor/nexus-compress/releases".to_string(),
+                        release_url: "https://github.com/rakkio/nexus-compress/releases".to_string(),
                         release_notes: String::new(),
                     });
                 }
@@ -1939,7 +1939,7 @@ pub async fn check_github_update_cmd() -> Result<GithubUpdateInfo, String> {
         has_update: false,
         current_version: current.clone(),
         latest_version: current,
-        release_url: "https://github.com/bierfor/nexus-compress/releases".to_string(),
+        release_url: "https://github.com/rakkio/nexus-compress/releases".to_string(),
         release_notes: String::new(),
     })
 }

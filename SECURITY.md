@@ -149,7 +149,7 @@ branches (8 tests, all passing).
 **Please don't open a public GitHub issue for security problems.**
 
 Email **security@nexuscompress.dev** (PGP key on request) or use
-[GitHub's Security tab → "Report a vulnerability"](https://github.com/bierfor/nexus-compress/security/advisories/new).
+[GitHub's Security tab → "Report a vulnerability"](https://github.com/rakkio/nexus-compress/security/advisories/new).
 
 We commit to:
 

@@ -37,7 +37,7 @@ Download the v0.1.2 build for your platform from the GitHub release page. The
 release draft will be at:
 
 ```
-https://github.com/bierfor/nexus-compress/releases/tag/v0.1.2
+https://github.com/rakkio/nexus-compress/releases/tag/v0.1.2
 ```
 
 Install the GUI app, then make sure the **standalone CLI** is also on your
@@ -343,7 +343,7 @@ nexus d --password 'demo' /tmp/big_corrupted.nxr /tmp/big_recovered.bin
 ## 5. Reporting findings
 
 If a test fails, please open a GitHub issue at
-`https://github.com/bierfor/nexus-compress/issues/new` with:
+`https://github.com/rakkio/nexus-compress/issues/new` with:
 
 - **Title:** `[v0.1.2 test] <which test, what's wrong>` (e.g. `[v0.1.2 test B] RS recovery returns wrong data`)
 - **Body:**

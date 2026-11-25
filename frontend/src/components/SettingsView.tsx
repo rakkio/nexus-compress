@@ -578,9 +578,9 @@ function AboutSection() {
           <AboutRow
             icon={Github}
             label={t("settings.about.repo")}
-            value="github.com/bierfor/nexus-compress"
+            value="github.com/rakkio/nexus-compress"
             mono
-            href="https://github.com/bierfor/nexus-compress"
+            href="https://github.com/rakkio/nexus-compress"
           />
         </div>
       </SectionCard>

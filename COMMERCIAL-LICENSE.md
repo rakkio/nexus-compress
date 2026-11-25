@@ -124,7 +124,7 @@ SOFTWARE.
 
 - **Licensing:** licensing@nexuscompress.dev
 - **Security disclosures:** see [SECURITY.md](./SECURITY.md)
-- **Bug reports / features:** [GitHub Issues](https://github.com/bierfor/nexus-compress/issues)
+- **Bug reports / features:** [GitHub Issues](https://github.com/rakkio/nexus-compress/issues)
 
 This document is **informational and non-binding**. The Commercial License
 Terms are established exclusively by the signed license agreement between
