@@ -865,6 +865,22 @@ fn pcm16_delta_decode_all(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+fn resolve_extract_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    if name.starts_with("__nx6r_apk__/") {
+        // Use a SHA-256 hex key so case-sensitive APK entries (e.g. res/Cc.xml vs res/cc.xml)
+        // never collide on case-insensitive filesystems like Windows NTFS or macOS APFS.
+        let digest = Sha256::digest(name.as_bytes());
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write;
+            let _ = write!(hex, "{b:02x}");
+        }
+        Ok(dir.join("__nx6r_apk__").join(hex))
+    } else {
+        safe_join(dir, name)
+    }
+}
+
 fn process_stream_subset<R: Read>(
     mut xz: XzDecoder<R>,
     subset: &[TocEntry],
@@ -885,7 +901,7 @@ fn process_stream_subset<R: Read>(
         // Handle SHA-256 deduplicated entries that share the same offset & pre_size.
         if last_offset == Some(entry.offset) && entry.pre_size == last_pre_size {
             if let (Some(dir), Some(src)) = (output_dir, last_out_file.as_ref()) {
-                let out_f = safe_join(dir, &entry.name)?;
+                let out_f = resolve_extract_path(dir, &entry.name)?;
                 if let Some(p) = out_f.parent() {
                     fs::create_dir_all(p)?;
                 }
@@ -910,7 +926,7 @@ fn process_stream_subset<R: Read>(
         }
 
         let mut writer = if let Some(dir) = output_dir {
-            let out_f = safe_join(dir, &entry.name)?;
+            let out_f = resolve_extract_path(dir, &entry.name)?;
             if let Some(p) = out_f.parent() {
                 fs::create_dir_all(p)?;
             }
@@ -1096,10 +1112,10 @@ pub fn unpack_nx6r(archive_path: &Path, output_dir: &Path) -> io::Result<Vec<Pat
             if let Some(p) = apk_out.parent() {
                 fs::create_dir_all(p)?;
             }
-            let src_dir = vroot.join(&manifest.apk_name);
             let mut zw = ZipWriter::new(BufWriter::new(File::create(&apk_out)?));
             for item in &manifest.entries {
-                let src_file = safe_join(&src_dir, &item.entry_name)?;
+                let vname = format!("__nx6r_apk__/{}/{}", manifest.apk_name, item.entry_name);
+                let src_file = resolve_extract_path(output_dir, &vname)?;
                 let method = if item.method == 0 {
                     CompressionMethod::Stored
                 } else {
@@ -1363,5 +1379,35 @@ mod tests {
         bytes[last] ^= 0xFF;
         fs::write(&out_nxs, &bytes).unwrap();
         assert!(verify_nx6r(&out_nxs).is_err());
+    }
+
+    #[test]
+    fn nx6r_apk_case_collision_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let apk = dir.path().join("case.apk");
+        {
+            let f = File::create(&apk).unwrap();
+            let mut zw = ZipWriter::new(f);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zw.start_file("res/Cc.xml", opts).unwrap();
+            zw.write_all(b"<navigation/>").unwrap();
+            zw.start_file("res/cc.xml", opts).unwrap();
+            zw.write_all(b"<vector/>").unwrap();
+            zw.finish().unwrap();
+        }
+
+        let out_nxs = dir.path().join("case.nxs");
+        pack_nx6r(&apk, &out_nxs, 1, true, Some(2)).unwrap();
+
+        let unp_dir = dir.path().join("unpacked");
+        unpack_nx6r(&out_nxs, &unp_dir).unwrap();
+
+        let mut zr = zip::ZipArchive::new(File::open(unp_dir.join("case.apk")).unwrap()).unwrap();
+        let mut upper = String::new();
+        zr.by_name("res/Cc.xml").unwrap().read_to_string(&mut upper).unwrap();
+        let mut lower = String::new();
+        zr.by_name("res/cc.xml").unwrap().read_to_string(&mut lower).unwrap();
+        assert_eq!(upper, "<navigation/>");
+        assert_eq!(lower, "<vector/>");
     }
 }
