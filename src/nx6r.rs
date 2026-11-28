@@ -844,8 +844,24 @@ fn process_stream_subset<R: Read>(
     let mut stream_pos = 0u64;
     let mut buf = vec![0u8; 256 * 1024];
     let mut count = 0usize;
+    let mut last_offset: Option<u64> = None;
+    let mut last_pre_size: u64 = 0;
+    let mut last_out_file: Option<PathBuf> = None;
 
     for entry in sorted {
+        // Handle SHA-256 deduplicated entries that share the same offset & pre_size.
+        if last_offset == Some(entry.offset) && entry.pre_size == last_pre_size {
+            if let (Some(dir), Some(src)) = (output_dir, last_out_file.as_ref()) {
+                let out_f = safe_join(dir, &entry.name)?;
+                if let Some(p) = out_f.parent() {
+                    fs::create_dir_all(p)?;
+                }
+                fs::copy(src, &out_f)?;
+            }
+            count += 1;
+            continue;
+        }
+
         if entry.offset > stream_pos {
             let mut to_skip = entry.offset - stream_pos;
             let max_buf = buf.len() as u64;
@@ -904,6 +920,9 @@ fn process_stream_subset<R: Read>(
                 ));
             }
         }
+        last_offset = Some(entry.offset);
+        last_pre_size = entry.pre_size;
+        last_out_file = writer.map(|(p, _)| p);
         count += 1;
     }
     Ok(count)
