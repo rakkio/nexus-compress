@@ -832,6 +832,39 @@ pub fn read_info(archive_path: &Path) -> io::Result<Nx6rInfo> {
     })
 }
 
+fn arm64_bcj_decode_block(buf: &mut [u8], aligned_len: usize, base_offset: u64) {
+    let mut i = 0usize;
+    while i + 4 <= aligned_len {
+        if (buf[i + 3] & 0xFC) == 0x94 {
+            let insn = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+            let abs26 = insn & 0x03FF_FFFF;
+            let pc_word = ((base_offset + i as u64) >> 2) as u32;
+            let imm26 = abs26.wrapping_sub(pc_word) & 0x03FF_FFFF;
+            let orig = (0x94u32 << 24) | imm26;
+            buf[i..i + 4].copy_from_slice(&orig.to_le_bytes());
+        }
+        i += 4;
+    }
+}
+
+fn pcm16_delta_decode_all(raw: &[u8]) -> Vec<u8> {
+    if raw.len() < 48 {
+        return raw.to_vec();
+    }
+    let mut out = raw.to_vec();
+    let mut prev: i32 = 0;
+    let limit = out.len() - ((out.len() - 44) % 2);
+    let mut i = 44usize;
+    while i < limit {
+        let diff = i16::from_le_bytes([out[i], out[i + 1]]) as i32;
+        let sample = (prev.wrapping_add(diff)) as i16;
+        prev = sample as i32;
+        out[i..i + 2].copy_from_slice(&sample.to_le_bytes());
+        i += 2;
+    }
+    out
+}
+
 fn process_stream_subset<R: Read>(
     mut xz: XzDecoder<R>,
     subset: &[TocEntry],
@@ -888,21 +921,73 @@ fn process_stream_subset<R: Read>(
 
         let mut hasher = Sha256::new();
         let mut rem = entry.pre_size;
-        while rem > 0 {
-            let to_read = rem.min(buf.len() as u64) as usize;
-            let n = xz.read(&mut buf[..to_read])?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("unexpected EOF reading {}", entry.name),
-                ));
+
+        if entry.preprocessor == 2 {
+            let mut raw_pcm = Vec::with_capacity(entry.pre_size as usize);
+            while rem > 0 {
+                let to_read = rem.min(buf.len() as u64) as usize;
+                let n = xz.read(&mut buf[..to_read])?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("unexpected EOF reading {}", entry.name),
+                    ));
+                }
+                raw_pcm.extend_from_slice(&buf[..n]);
+                rem -= n as u64;
+                stream_pos += n as u64;
             }
-            hasher.update(&buf[..n]);
+            let decoded = pcm16_delta_decode_all(&raw_pcm);
+            hasher.update(&decoded);
             if let Some((_, ref mut w)) = writer {
-                w.write_all(&buf[..n])?;
+                w.write_all(&decoded)?;
             }
-            rem -= n as u64;
-            stream_pos += n as u64;
+        } else {
+            let mut carry_len = 0usize;
+            let mut file_pos = 0u64;
+            while rem > 0 {
+                let avail = buf.len().saturating_sub(carry_len);
+                let to_read = rem.min(avail as u64) as usize;
+                let n = xz.read(&mut buf[carry_len..carry_len + to_read])?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("unexpected EOF reading {}", entry.name),
+                    ));
+                }
+                rem -= n as u64;
+                stream_pos += n as u64;
+                let total_buf = carry_len + n;
+
+                if entry.preprocessor == 1 {
+                    let aligned = (total_buf / 4) * 4;
+                    if aligned > 0 {
+                        arm64_bcj_decode_block(&mut buf[..aligned], aligned, file_pos);
+                        hasher.update(&buf[..aligned]);
+                        if let Some((_, ref mut w)) = writer {
+                            w.write_all(&buf[..aligned])?;
+                        }
+                        file_pos += aligned as u64;
+                    }
+                    carry_len = total_buf - aligned;
+                    if carry_len > 0 {
+                        buf.copy_within(aligned..total_buf, 0);
+                    }
+                } else {
+                    hasher.update(&buf[..total_buf]);
+                    if let Some((_, ref mut w)) = writer {
+                        w.write_all(&buf[..total_buf])?;
+                    }
+                    file_pos += total_buf as u64;
+                    carry_len = 0;
+                }
+            }
+            if carry_len > 0 {
+                hasher.update(&buf[..carry_len]);
+                if let Some((_, ref mut w)) = writer {
+                    w.write_all(&buf[..carry_len])?;
+                }
+            }
         }
         if let Some((_, ref mut w)) = writer {
             w.flush()?;
