@@ -93,7 +93,7 @@ sha2 = "0.10"
 # v5 LZMA backend. xz2 wraps liblzma (compiled from C source via
 # xz-sys), battle-tested by every Linux distro and used by `xz`.
 # Pure-Rust alternative would be `xz = "0.4"`.
-xz2 = "0.1"
+xz2 = { package = "liblzma", version = "0.4" }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # v6 AST minifier. swc_core is the meta-crate that unifies the
 # swc_ecma_parser / swc_ecma_codegen / swc_ecma_ast sub-crates
