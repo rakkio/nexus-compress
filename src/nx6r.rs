@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -881,11 +882,29 @@ fn resolve_extract_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
     }
 }
 
+enum ExtractSink {
+    File(PathBuf, BufWriter<File>),
+    Mem(Vec<u8>),
+}
+
+impl ExtractSink {
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        match self {
+            ExtractSink::File(_, w) => w.write_all(data),
+            ExtractSink::Mem(v) => {
+                v.extend_from_slice(data);
+                Ok(())
+            }
+        }
+    }
+}
+
 fn process_stream_subset<R: Read>(
     mut xz: XzDecoder<R>,
     subset: &[TocEntry],
     sha_map: &HashMap<String, [u8; 32]>,
     output_dir: Option<&Path>,
+    mut apk_mem: Option<&mut HashMap<String, Arc<[u8]>>>,
 ) -> io::Result<usize> {
     let mut sorted = subset.to_vec();
     sorted.sort_by_key(|e| e.offset);
@@ -896,10 +915,20 @@ fn process_stream_subset<R: Read>(
     let mut last_offset: Option<u64> = None;
     let mut last_pre_size: u64 = 0;
     let mut last_out_file: Option<PathBuf> = None;
+    let mut last_mem_bytes: Option<Arc<[u8]>> = None;
 
     for entry in sorted {
+        let is_virtual_apk = entry.name.starts_with("__nx6r_apk__/");
+
         // Handle SHA-256 deduplicated entries that share the same offset & pre_size.
         if last_offset == Some(entry.offset) && entry.pre_size == last_pre_size {
+            if is_virtual_apk {
+                if let (Some(map), Some(bytes)) = (apk_mem.as_deref_mut(), last_mem_bytes.as_ref()) {
+                    map.insert(entry.name.clone(), Arc::clone(bytes));
+                    count += 1;
+                    continue;
+                }
+            }
             if let (Some(dir), Some(src)) = (output_dir, last_out_file.as_ref()) {
                 let out_f = resolve_extract_path(dir, &entry.name)?;
                 if let Some(p) = out_f.parent() {
@@ -925,12 +954,14 @@ fn process_stream_subset<R: Read>(
             }
         }
 
-        let mut writer = if let Some(dir) = output_dir {
+        let mut sink = if is_virtual_apk && apk_mem.is_some() {
+            Some(ExtractSink::Mem(Vec::with_capacity(entry.original_size as usize)))
+        } else if let Some(dir) = output_dir {
             let out_f = resolve_extract_path(dir, &entry.name)?;
             if let Some(p) = out_f.parent() {
                 fs::create_dir_all(p)?;
             }
-            Some((out_f.clone(), BufWriter::new(File::create(&out_f)?)))
+            Some(ExtractSink::File(out_f.clone(), BufWriter::with_capacity(64 * 1024, File::create(&out_f)?)))
         } else {
             None
         };
@@ -955,8 +986,8 @@ fn process_stream_subset<R: Read>(
             }
             let decoded = pcm16_delta_decode_all(&raw_pcm);
             hasher.update(&decoded);
-            if let Some((_, ref mut w)) = writer {
-                w.write_all(&decoded)?;
+            if let Some(ref mut s) = sink {
+                s.write_all(&decoded)?;
             }
         } else {
             let mut carry_len = 0usize;
@@ -980,8 +1011,8 @@ fn process_stream_subset<R: Read>(
                     if aligned > 0 {
                         arm64_bcj_decode_block(&mut buf[..aligned], aligned, file_pos);
                         hasher.update(&buf[..aligned]);
-                        if let Some((_, ref mut w)) = writer {
-                            w.write_all(&buf[..aligned])?;
+                        if let Some(ref mut s) = sink {
+                            s.write_all(&buf[..aligned])?;
                         }
                         file_pos += aligned as u64;
                     }
@@ -991,8 +1022,8 @@ fn process_stream_subset<R: Read>(
                     }
                 } else {
                     hasher.update(&buf[..total_buf]);
-                    if let Some((_, ref mut w)) = writer {
-                        w.write_all(&buf[..total_buf])?;
+                    if let Some(ref mut s) = sink {
+                        s.write_all(&buf[..total_buf])?;
                     }
                     file_pos += total_buf as u64;
                     carry_len = 0;
@@ -1000,19 +1031,16 @@ fn process_stream_subset<R: Read>(
             }
             if carry_len > 0 {
                 hasher.update(&buf[..carry_len]);
-                if let Some((_, ref mut w)) = writer {
-                    w.write_all(&buf[..carry_len])?;
+                if let Some(ref mut s) = sink {
+                    s.write_all(&buf[..carry_len])?;
                 }
             }
-        }
-        if let Some((_, ref mut w)) = writer {
-            w.flush()?;
         }
 
         let digest: [u8; 32] = hasher.finalize().into();
         if let Some(expected) = sha_map.get(&entry.name) {
             if &digest != expected {
-                if let Some((path, _)) = writer {
+                if let Some(ExtractSink::File(path, _)) = sink {
                     let _ = fs::remove_file(path);
                 }
                 return Err(io::Error::new(
@@ -1023,7 +1051,22 @@ fn process_stream_subset<R: Read>(
         }
         last_offset = Some(entry.offset);
         last_pre_size = entry.pre_size;
-        last_out_file = writer.map(|(p, _)| p);
+        last_out_file = None;
+        last_mem_bytes = None;
+        match sink {
+            Some(ExtractSink::File(path, mut w)) => {
+                w.flush()?;
+                last_out_file = Some(path);
+            }
+            Some(ExtractSink::Mem(vec)) => {
+                let arc: Arc<[u8]> = Arc::from(vec);
+                last_mem_bytes = Some(Arc::clone(&arc));
+                if let Some(map) = apk_mem.as_deref_mut() {
+                    map.insert(entry.name, arc);
+                }
+            }
+            None => {}
+        }
         count += 1;
     }
     Ok(count)
@@ -1034,8 +1077,8 @@ pub fn verify_nx6r(archive_path: &Path) -> io::Result<usize> {
     if info.chunks.is_empty() {
         let mut f = File::open(archive_path)?;
         f.seek(SeekFrom::Start(info.payload_offset))?;
-        let xz = XzDecoder::new(BufReader::new(f));
-        process_stream_subset(xz, &info.toc_entries, &info.sha256_map, None)
+        let xz = XzDecoder::new(BufReader::with_capacity(256 * 1024, f));
+        process_stream_subset(xz, &info.toc_entries, &info.sha256_map, None, None)
     } else {
         let mut by_chunk: HashMap<u8, Vec<TocEntry>> = HashMap::new();
         for e in &info.toc_entries {
@@ -1052,8 +1095,8 @@ pub fn verify_nx6r(archive_path: &Path) -> io::Result<usize> {
                 let mut f = File::open(archive_path)?;
                 f.seek(SeekFrom::Start(info.payload_offset + cm.payload_offset))?;
                 let bounded = f.take(cm.compressed_size);
-                let xz = XzDecoder::new(BufReader::new(bounded));
-                process_stream_subset(xz, &subset, &info.sha256_map, None)
+                let xz = XzDecoder::new(BufReader::with_capacity(256 * 1024, bounded));
+                process_stream_subset(xz, &subset, &info.sha256_map, None, None)
             })
             .collect();
         let mut total = 0usize;
@@ -1067,34 +1110,49 @@ pub fn verify_nx6r(archive_path: &Path) -> io::Result<usize> {
 pub fn unpack_nx6r(archive_path: &Path, output_dir: &Path) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(output_dir)?;
     let info = read_info(archive_path)?;
+    let mut apk_entries: HashMap<String, Arc<[u8]>> = HashMap::new();
 
     if info.chunks.is_empty() {
         let mut f = File::open(archive_path)?;
         f.seek(SeekFrom::Start(info.payload_offset))?;
-        let xz = XzDecoder::new(BufReader::new(f));
-        process_stream_subset(xz, &info.toc_entries, &info.sha256_map, Some(output_dir))?;
+        let xz = XzDecoder::new(BufReader::with_capacity(256 * 1024, f));
+        process_stream_subset(
+            xz,
+            &info.toc_entries,
+            &info.sha256_map,
+            Some(output_dir),
+            Some(&mut apk_entries),
+        )?;
     } else {
         let mut by_chunk: HashMap<u8, Vec<TocEntry>> = HashMap::new();
         for e in &info.toc_entries {
             by_chunk.entry(e.chunk_id).or_default().push(e.clone());
         }
-        let results: Vec<io::Result<usize>> = info
+        let results: Vec<io::Result<HashMap<String, Arc<[u8]>>>> = info
             .chunks
             .par_iter()
             .map(|cm| {
                 let subset = by_chunk.get(&cm.chunk_id).cloned().unwrap_or_default();
                 if subset.is_empty() {
-                    return Ok(0);
+                    return Ok(HashMap::new());
                 }
                 let mut f = File::open(archive_path)?;
                 f.seek(SeekFrom::Start(info.payload_offset + cm.payload_offset))?;
                 let bounded = f.take(cm.compressed_size);
-                let xz = XzDecoder::new(BufReader::new(bounded));
-                process_stream_subset(xz, &subset, &info.sha256_map, Some(output_dir))
+                let xz = XzDecoder::new(BufReader::with_capacity(256 * 1024, bounded));
+                let mut local_mem = HashMap::new();
+                process_stream_subset(
+                    xz,
+                    &subset,
+                    &info.sha256_map,
+                    Some(output_dir),
+                    Some(&mut local_mem),
+                )?;
+                Ok(local_mem)
             })
             .collect();
         for r in results {
-            r?;
+            apk_entries.extend(r?);
         }
     }
 
@@ -1106,16 +1164,14 @@ pub fn unpack_nx6r(archive_path: &Path, output_dir: &Path) -> io::Result<Vec<Pat
     }
 
     if !info.apk_manifests.is_empty() {
-        let vroot = output_dir.join("__nx6r_apk__");
         for manifest in &info.apk_manifests {
             let apk_out = safe_join(output_dir, &manifest.apk_name)?;
             if let Some(p) = apk_out.parent() {
                 fs::create_dir_all(p)?;
             }
-            let mut zw = ZipWriter::new(BufWriter::new(File::create(&apk_out)?));
+            let mut zw = ZipWriter::new(BufWriter::with_capacity(256 * 1024, File::create(&apk_out)?));
             for item in &manifest.entries {
                 let vname = format!("__nx6r_apk__/{}/{}", manifest.apk_name, item.entry_name);
-                let src_file = resolve_extract_path(output_dir, &vname)?;
                 let method = if item.method == 0 {
                     CompressionMethod::Stored
                 } else {
@@ -1123,13 +1179,17 @@ pub fn unpack_nx6r(archive_path: &Path, output_dir: &Path) -> io::Result<Vec<Pat
                 };
                 let opts = SimpleFileOptions::default().compression_method(method);
                 zw.start_file(item.entry_name.as_str(), opts).map_err(io::Error::other)?;
-                let mut rf = BufReader::new(File::open(&src_file)?);
-                io::copy(&mut rf, &mut zw)?;
+                if let Some(bytes) = apk_entries.get(&vname) {
+                    zw.write_all(bytes)?;
+                } else {
+                    let src_file = resolve_extract_path(output_dir, &vname)?;
+                    let mut rf = BufReader::new(File::open(&src_file)?);
+                    io::copy(&mut rf, &mut zw)?;
+                }
             }
             zw.finish().map_err(io::Error::other)?;
             written.push(apk_out);
         }
-        let _ = fs::remove_dir_all(&vroot);
     }
 
     Ok(written)
